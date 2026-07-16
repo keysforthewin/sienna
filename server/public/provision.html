@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sienna · Provisioning</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <header>
+    <h1>Sienna · Provisioning</h1>
+    <div class="header-actions">
+      <a href="/dashboard.html" class="button">Dashboard →</a>
+    </div>
+  </header>
+
+  <main class="grid" style="grid-template-columns: 1fr; max-width: 720px; margin: 0 auto;">
+    <section class="panel">
+      <h2>Bluetooth</h2>
+      <button id="pair-btn" class="primary">Pair with Sienna over Bluetooth</button>
+      <div style="margin-top: 8px; color: var(--muted);">Status: <span id="pair-status">not paired</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Wi-Fi credentials</h2>
+      <form id="prov-form" style="display: grid; gap: 12px;">
+        <label>Wi-Fi network
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button type="button" id="scan-btn">Scan</button>
+            <select id="ssid-select" style="flex: 1;"><option value="">(scan or type)</option></select>
+            <input type="text" id="ssid-input" placeholder="or type SSID" style="flex: 1;">
+          </div>
+          <div id="scan-status" style="margin-top: 4px; color: var(--muted);" hidden></div>
+        </label>
+        <label>Password
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="password" id="pass-input" style="flex: 1;">
+            <button type="button" id="pass-reveal" aria-label="Show password" title="Show password">👁</button>
+          </div>
+        </label>
+        <label>Server URL
+          <input type="text" id="server-input">
+        </label>
+        <label>Auth token
+          <input type="password" id="token-input">
+        </label>
+        <button type="submit" class="primary" id="save-btn">Save & connect</button>
+        <div id="connect-progress" class="connect-progress" hidden></div>
+        <button type="button" id="open-dashboard" class="primary" hidden>Open Dashboard →</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Device status (live over BLE)</h2>
+      <div id="dev-status" style="font-family: monospace;">◯ idle</div>
+    </section>
+  </main>
+
+  <script type="module" src="/js/provision.js"></script>
+</body>
+</html>

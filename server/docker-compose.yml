@@ -1,0 +1,73 @@
+# Sienna backend stack: dashboard server + MongoDB.
+#
+#   cd server
+#   cp .env.example .env      # then edit DASHBOARD_TOKEN / API keys / Mongo creds
+#   docker compose up         # add -d to run detached, --build to rebuild
+#
+# Compose reads ./.env for ${VAR} interpolation below, and passes the app's
+# config to the server via env_file. The `environment:` overrides win over
+# env_file and force container-correct values (HTTPS, 0.0.0.0, volume paths).
+#
+# TLS: the server serves HTTPS/WSS using the host's ./certs bind-mounted into
+# the container (read-only). Generate them first if you haven't — see the TLS
+# section of .env.example for the openssl one-liner.
+
+services:
+  server:
+    build: .
+    image: sienna-dashboard-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "3387"
+      LOCALHOST_ONLY: ""          # bind 0.0.0.0 so the published port works
+      TLS_CERT: /certs/server.crt # HTTPS/WSS — certs bind-mounted below
+      TLS_KEY: /certs/server.key
+      RECORDINGS_DIR: /data/recordings
+      IMAGES_DIR: /data/images
+      # Ready-to-use connection string for the `mongo` service below.
+      MONGODB_URI: "mongodb://${MONGO_INITDB_ROOT_USERNAME:-root}:${MONGO_INITDB_ROOT_PASSWORD:-changeme}@mongo:27017/${MONGO_DB:-sienna}?authSource=admin"
+    ports:
+      - "${SERVER_PORT:-3387}:3387"
+    volumes:
+      - recordings:/data/recordings
+      - images:/data/images
+      - ./certs:/certs:ro          # host TLS certs (gitignored, never in the image)
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      # HTTPS now; skip verification of the self-signed cert for the in-container probe.
+      test:
+        [
+          "CMD-SHELL",
+          "NODE_TLS_REJECT_UNAUTHORIZED=0 node -e \"fetch('https://localhost:3387/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-sienna}
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  mongo-data:
+  recordings:
+  images:

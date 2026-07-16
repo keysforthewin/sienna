@@ -1,0 +1,21 @@
+{
+  "name": "sienna-dashboard-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --env-file=.env index.js",
+    "test": "node --test --env-file-if-exists=.env.test"
+  },
+  "dependencies": {
+    "@google/genai": "^1.52.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongodb": "^6.10.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  }
+}

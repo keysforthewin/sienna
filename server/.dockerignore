@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+recordings
+.smoke-recordings
+certs
+*.test.js
+.git
+.gitignore
+Dockerfile
+.dockerignore
+docker-compose.yml

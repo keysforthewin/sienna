@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sienna · Dashboard</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <h1>Sienna</h1>
+    </div>
+
+    <!-- View switcher: swaps the two content areas. .view-tab is whitelisted in
+         dashboard.js's disableAllControls so it stays usable when offline. -->
+    <div class="view-switcher" role="tablist" aria-label="Dashboard area">
+      <button class="view-tab" data-view="io" role="tab" aria-selected="true">Diagnostics</button>
+      <button class="view-tab" data-view="sienna" role="tab" aria-selected="false">Interact</button>
+      <button class="view-tab" data-view="usage" role="tab" aria-selected="false">Usage</button>
+    </div>
+
+    <div class="status-cluster">
+      <span class="status">
+        <span class="dot bad" id="server-dot"></span>
+        <span class="status-label">Server</span>
+        <span id="server-text">offline</span>
+      </span>
+      <span class="status">
+        <span class="dot bad" id="state-dot"></span>
+        <span class="status-label">Sienna</span>
+        <span id="state-text">OFFLINE</span>
+      </span>
+      <span class="state-detail" id="state-detail"></span>
+    </div>
+
+    <div class="header-actions">
+      <button id="settings-btn">Settings</button>
+      <a href="/provision.html"><button id="reprovision-btn">Re-provision</button></a>
+      <button id="reboot-btn" class="danger-ghost">Reboot</button>
+    </div>
+  </header>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="settings-form">
+      <h2>Server settings</h2>
+      <label>Server WebSocket URL
+        <input type="text" id="settings-url" placeholder="wss://192.168.1.111:3387/ws/browser" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Dashboard token
+        <input type="text" id="settings-token" placeholder="(from server /api/token)" autocomplete="off" spellcheck="false">
+      </label>
+      <p class="settings-hint" id="settings-hint"></p>
+      <div class="settings-actions">
+        <button type="button" id="settings-reset">Reset to default</button>
+        <span class="spacer"></span>
+        <button type="button" id="settings-cancel">Cancel</button>
+        <button type="button" id="settings-save" class="primary">Save &amp; reconnect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- AREA 1 — Diagnostics (device I/O). Default visible. Visual grid:
+       col 1 = Microphone + Light sensor + LEDs; col 2 = Speaker + Voice;
+       Camera spans full width below. See .io-grid / .io-stack in app.css.
+       Panels init by id, so DOM order/nesting is purely for layout. -->
+  <main id="view-io" class="view io-grid">
+    <!-- Column 1: Microphone, then Light sensor + LEDs under it. -->
+    <div class="io-stack">
+      <section class="panel" id="panel-audio">
+        <h2>Microphone</h2>
+        <div>(microphone panel placeholder)</div>
+      </section>
+
+      <section class="panel" id="panel-ldr">
+        <h2>Light sensor</h2>
+        <div>(LDR panel placeholder)</div>
+      </section>
+
+      <section class="panel" id="panel-leds">
+        <h2>LEDs</h2>
+        <div>(LED panel placeholder)</div>
+      </section>
+    </div>
+
+    <!-- Column 2: Speaker (directly right of Microphone), then Voice. -->
+    <div class="io-stack">
+      <section class="panel" id="panel-speaker">
+        <h2>Speaker</h2>
+        <div>(speaker panel placeholder)</div>
+      </section>
+
+      <section class="panel" id="panel-tts">
+        <h2>Voice</h2>
+        <div>(voice panel placeholder)</div>
+      </section>
+    </div>
+
+    <!-- Full-width camera below both columns. -->
+    <section class="panel" id="panel-camera">
+      <h2>Camera</h2>
+      <div>(camera panel placeholder)</div>
+    </section>
+  </main>
+
+  <!-- AREA 2 — Sienna. Hidden until selected. Full-bleed: no outer card. The
+       panel renders the composer + speech monitor + autonomy on top, then the tabs,
+       then a newest-on-top infinite-scroll feed. -->
+  <main id="view-sienna" class="view sienna-view" hidden>
+    <section id="panel-sienna">
+      <div>(Sienna agent panel placeholder)</div>
+    </section>
+  </main>
+
+  <!-- AREA 3 — Usage. Hidden until selected. Gemini token usage + cost, bucketed by
+       hour / day / week / month. REST-backed (device-independent), so it stays
+       usable while the device is offline. -->
+  <main id="view-usage" class="view usage-view" hidden>
+    <section id="panel-usage">
+      <div>(Usage panel placeholder)</div>
+    </section>
+  </main>
+
+  <script type="module" src="/js/dashboard.js"></script>
+</body>
+</html>

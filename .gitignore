@@ -1,0 +1,8 @@
+.vscode
+.claude/scheduled_tasks.lock
+node_modules
+*.pyc
+.env
+server/recordings/
+server/images/
+server/certs/
