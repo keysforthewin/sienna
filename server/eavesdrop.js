@@ -45,7 +45,16 @@ export function createEavesdrop({
     const res = await micListener.listen({ seconds, maxSeconds: seconds });
     if (!res.ok) return false;            // couldn't listen (offline/busy) → don't burn the day, retry later
     const text = (res.heardSpeech ? res.transcript || "" : "").trim();
-    if (!text) return true;               // listened, heard nothing → that was today's eavesdrop
+    // "Heard nothing" includes Scribe's non-speech artifacts: empty/whitespace,
+    // punctuation-only commits ("..."), and bracketed sound-effect annotations
+    // ("(door closes)", "[music]"). Require at least one letter or digit OUTSIDE
+    // brackets before treating it as someone actually talking — otherwise she'd
+    // strike up a conversation (or a music search) over a closing door.
+    const spoken = text.replace(/\([^)]*\)|\[[^\]]*\]/g, " ");
+    if (!/[\p{L}\p{N}]/u.test(spoken)) {
+      if (text) log(`heard no real speech (${JSON.stringify(text.slice(0, 60))}) — skipping`);
+      return true;                        // that was today's eavesdrop
+    }
     // A real conversation may have started DURING the window — that utterance
     // already routed via PTT; don't double-route it.
     if (conversationInFlight()) return true;

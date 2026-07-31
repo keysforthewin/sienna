@@ -39,9 +39,10 @@ async function withServer(fn, opts = {}) {
   const transcriber = makeTranscriberSpy();
   const micStream = createMicStream({ bridge });
   const agent = opts.agent === undefined ? makeAgentSpy() : opts.agent;
-  const volume = opts.volume !== undefined
-    ? opts.volume
-    : createVolume({ initialPercent: 100, onChange: (percent) => bridge.broadcastToBrowsers({ type: "volume", percent }) });
+  const mkVol = (channel) => createVolume({ initialPercent: 100, onChange: (percent) => bridge.broadcastToBrowsers({ type: "volume", channel, percent }) });
+  const volumes = opts.volumes !== undefined
+    ? opts.volumes
+    : { voice: mkVol("voice"), music: mkVol("music") };
   const server = http.createServer();
   const wss = new WebSocketServer({ noServer: true });
   server.on("upgrade", (req, sock, head) => {
@@ -50,11 +51,12 @@ async function withServer(fn, opts = {}) {
     wss.handleUpgrade(req, sock, head, (ws) => wss.emit("connection", ws, req));
   });
   const audioOut = opts.audioOut === undefined ? null : opts.audioOut;
-  attachBrowserWs(wss, bridge, TOKEN, recorder, transcriber, micStream, agent, volume, audioOut, opts.getNowPlaying ?? null);
+  const ptt = opts.ptt === undefined ? null : opts.ptt;
+  attachBrowserWs(wss, bridge, TOKEN, recorder, transcriber, micStream, agent, volumes, audioOut, opts.getNowPlaying ?? null, ptt);
   await new Promise((r) => server.listen(0, r));
   const port = server.address().port;
   try {
-    await fn({ port, bridge, recorder, transcriber, micStream, agent, volume });
+    await fn({ port, bridge, recorder, transcriber, micStream, agent, volumes });
   } finally {
     wss.close();
     // Force-close lingering sockets so a test that asserts before ws.close()
@@ -334,24 +336,39 @@ test("closing a listening browser releases its mic-stream token", async () => {
   });
 });
 
-test("set_volume updates the master gain, acks, and is not forwarded to the device", async () => {
-  await withServer(async ({ port, bridge, volume }) => {
+test("set_volume with a channel updates only that gain, acks, and is not forwarded to the device", async () => {
+  await withServer(async ({ port, bridge, volumes }) => {
     const deviceSpy = { sent: [], send(p) { this.sent.push(p); }, on() {}, close() {} };
     bridge.attachDevice(deviceSpy);
     const ws = connect(port, TOKEN);
     await waitOpen(ws);
     const messages = [];
     ws.on("message", (m) => messages.push(safeJson(m)));
-    ws.send(JSON.stringify({ type: "set_volume", ref: "v1", percent: 250 }));
+    ws.send(JSON.stringify({ type: "set_volume", ref: "v1", percent: 250, channel: "voice" }));
+    ws.send(JSON.stringify({ type: "set_volume", ref: "v2", percent: 60, channel: "music" }));
     await new Promise((r) => setTimeout(r, 30));
-    assert.equal(volume.getPercent(), 250);
+    assert.equal(volumes.voice.getPercent(), 250);
+    assert.equal(volumes.music.getPercent(), 60);
     assert.ok(messages.some((m) => m && m.type === "ack" && m.ref === "v1"));
+    assert.ok(messages.some((m) => m && m.type === "ack" && m.ref === "v2"));
     assert.ok(!deviceSpy.sent.some((p) => /set_volume/.test(p)), "never forwarded to the device");
     ws.close();
   });
 });
 
-test("browser binary frames are scaled by the master volume", async () => {
+test("set_volume without a channel sets BOTH gains (legacy master semantics)", async () => {
+  await withServer(async ({ port, volumes }) => {
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    ws.send(JSON.stringify({ type: "set_volume", ref: "v1", percent: 150 }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(volumes.voice.getPercent(), 150);
+    assert.equal(volumes.music.getPercent(), 150);
+    ws.close();
+  });
+});
+
+test("browser binary frames are scaled by the VOICE volume (speech channel)", async () => {
   await withServer(async ({ port, bridge }) => {
     const deviceBin = [];
     const deviceSpy = {
@@ -361,7 +378,7 @@ test("browser binary frames are scaled by the master volume", async () => {
     bridge.attachDevice(deviceSpy);
     const ws = connect(port, TOKEN);
     await waitOpen(ws);
-    ws.send(JSON.stringify({ type: "set_volume", ref: "v1", percent: 200 }));
+    ws.send(JSON.stringify({ type: "set_volume", ref: "v1", percent: 200, channel: "voice" }));
     await new Promise((r) => setTimeout(r, 30));
     // Two int16-LE samples [1000, -2000] → at 200% → [2000, -4000].
     const pcm = Buffer.alloc(4);
@@ -376,20 +393,88 @@ test("browser binary frames are scaled by the master volume", async () => {
   });
 });
 
-test("a connecting browser is told the current master volume", async () => {
-  const volume = createVolume({ initialPercent: 175, maxPercent: 400 });
+test("a connecting browser is told BOTH channel volumes", async () => {
+  const volumes = {
+    voice: createVolume({ initialPercent: 175, maxPercent: 400 }),
+    music: createVolume({ initialPercent: 90, maxPercent: 400 }),
+  };
   await withServer(async ({ port }) => {
     const ws = connect(port, TOKEN);
     const messages = [];
     ws.on("message", (m) => messages.push(safeJson(m))); // before open: connect-time frames race the open continuation
     await waitOpen(ws);
     await new Promise((r) => setTimeout(r, 30));
-    const vol = messages.find((m) => m && m.type === "volume");
-    assert.ok(vol, "expected a volume snapshot on connect");
-    assert.equal(vol.percent, 175);
-    assert.equal(vol.max, 400);
+    const voice = messages.find((m) => m && m.type === "volume" && m.channel === "voice");
+    const music = messages.find((m) => m && m.type === "volume" && m.channel === "music");
+    assert.ok(voice && music, "expected a volume snapshot per channel on connect");
+    assert.equal(voice.percent, 175);
+    assert.equal(voice.max, 400);
+    assert.equal(music.percent, 90);
     ws.close();
-  }, { volume });
+  }, { volumes });
+});
+
+// ---- browser push-to-talk (the dashboard's on-screen talk button) ----
+// A {type:"ptt", pressed} message drives the SAME coordinator as the device's
+// physical GPIO 45 button, and is re-broadcast as a device-shaped button event
+// so every open Speech panel's "listening" light reacts.
+
+function makePttSpy() {
+  return { edges: [], onButton(p) { this.edges.push(p); } };
+}
+
+test("ptt press/release drives the coordinator and broadcasts button events", async () => {
+  const ptt = makePttSpy();
+  await withServer(async ({ port, bridge }) => {
+    const deviceSpy = { sent: [], send(p) { this.sent.push(p); }, on() {}, close() {} };
+    bridge.attachDevice(deviceSpy);
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    ws.send(JSON.stringify({ type: "ptt", ref: "p1", pressed: true }));
+    ws.send(JSON.stringify({ type: "ptt", ref: "p2", pressed: false }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(ptt.edges, [true, false]);
+    const buttons = messages.filter((m) => m && m.type === "button" && m.id === "ptt");
+    assert.deepEqual(buttons.map((b) => b.pressed), [true, false]);
+    assert.ok(messages.some((m) => m && m.type === "ack" && m.ref === "p1"));
+    assert.ok(!deviceSpy.sent.some((p) => /"ptt"/.test(p)), "never forwarded to the device");
+    ws.close();
+  }, { ptt });
+});
+
+test("ptt press with no device reports device_offline (the device mic is the input)", async () => {
+  const ptt = makePttSpy();
+  await withServer(async ({ port }) => {
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    ws.send(JSON.stringify({ type: "ptt", ref: "p1", pressed: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    const err = messages.find((m) => m && m.type === "command_error");
+    assert.ok(err);
+    assert.equal(err.reason, "device_offline");
+    assert.deepEqual(ptt.edges, []);
+    ws.close();
+  }, { ptt });
+});
+
+test("a browser vanishing mid-hold releases the ptt", async () => {
+  const ptt = makePttSpy();
+  await withServer(async ({ port, bridge }) => {
+    const deviceSpy = { sent: [], send() {}, on() {}, close() {} };
+    bridge.attachDevice(deviceSpy);
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    ws.send(JSON.stringify({ type: "ptt", ref: "p1", pressed: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(ptt.edges, [true]);
+    ws.terminate();                              // tab closed / crashed mid-hold
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(ptt.edges, [true, false]);  // auto-released
+  }, { ptt });
 });
 
 test("set_music_pacing updates the live pace via audioOut, acks, and is not forwarded to the device", async () => {

@@ -406,12 +406,37 @@ function makeSpeakDeps(overrides = {}) {
     command: async (c) => { if (c.type === "set_blue_flash") calls.flash.push(c.on); return { ok: true }; },
   };
   return { calls, deps: {
-    memory: {}, deviceRpc, audioOut, vision: {}, micListener, volume: {}, weather: {}, jukebox: null,
+    memory: {}, deviceRpc, audioOut, vision: {}, micListener, volumes: {}, weather: {}, jukebox: null,
     speakListen: { enabled: true, seconds: 10, drainCapMs: 4000 },
     clock: () => 0, sleep: async () => {},
     ...overrides,
   } };
 }
+
+test("set_volume: no channel (or 'both') sets both gains; a channel sets only its own", async () => {
+  const mkVol = (initial) => {
+    let p = initial;
+    return { setPercent: (v) => (p = v), getPercent: () => p };
+  };
+  const volumes = { voice: mkVol(100), music: mkVol(100) };
+  const { deps } = makeSpeakDeps({ volumes });
+  const reg = createToolRegistry(deps);
+
+  let r = await reg.execute("set_volume", { percent: 250 });
+  assert.ok(!r.is_error);
+  assert.equal(volumes.voice.getPercent(), 250);
+  assert.equal(volumes.music.getPercent(), 250);
+
+  r = await reg.execute("set_volume", { percent: 60, channel: "music" });
+  assert.ok(!r.is_error);
+  assert.equal(volumes.voice.getPercent(), 250);   // untouched
+  assert.equal(volumes.music.getPercent(), 60);
+
+  r = await reg.execute("set_volume", { percent: 300, channel: "voice" });
+  assert.ok(!r.is_error);
+  assert.equal(volumes.voice.getPercent(), 300);
+  assert.equal(volumes.music.getPercent(), 60);    // untouched
+});
 
 test("speak flashes, listens, unflashes, returns heard reply", async () => {
   const { calls, deps } = makeSpeakDeps();

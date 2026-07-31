@@ -110,15 +110,15 @@ test("speak falls back to buffered synthesis when streaming fails", async () => 
   assert.equal(bridge.bins.length, 2); // 8 bytes / (2 samples*2) = 2 frames
 });
 
-test("applies the master volume gain to streamed frames", async () => {
+test("applies the VOICE volume gain to streamed voice frames (music gain ignored)", async () => {
   const bridge = makeBridge();
-  const volume = createVolume({ initialPercent: 200 });
-  const audio = createAudioOut({ bridge, tts: {}, volume, sleep: noSleep, refGen, chunkSamples: 2 });
+  const volumes = { voice: createVolume({ initialPercent: 200 }), music: createVolume({ initialPercent: 50 }) };
+  const audio = createAudioOut({ bridge, tts: {}, volumes, sleep: noSleep, refGen, chunkSamples: 2 });
   await audio.streamPcm(Int16Array.from([100, -50])); // one 2-sample frame
   assert.equal(bridge.bins.length, 1);
   const frame = bridge.bins[0];
   assert.equal(frame[0], 0x03);            // playback tag intact
-  assert.equal(frame.readInt16LE(1), 200); // 100 × 2.0
+  assert.equal(frame.readInt16LE(1), 200); // 100 × 2.0 (voice gain)
   assert.equal(frame.readInt16LE(3), -100); // -50 × 2.0
 });
 
@@ -219,11 +219,11 @@ test("speakStream synthesizes EVERY sentence in order (v3: standalone, no previo
   assert.equal(r.frames, 2);
 });
 
-test("speakStream applies the master volume gain", async () => {
+test("speakStream applies the voice volume gain", async () => {
   const bridge = makeBridge();
   const tts = makeTts();
-  const volume = createVolume({ initialPercent: 200 });
-  const audio = createAudioOut({ bridge, tts, volume, sleep: noSleep, refGen, chunkSamples: 2, firstChars: 1, targetChars: 1 });
+  const volumes = { voice: createVolume({ initialPercent: 200 }), music: createVolume({ initialPercent: 100 }) };
+  const audio = createAudioOut({ bridge, tts, volumes, sleep: noSleep, refGen, chunkSamples: 2, firstChars: 1, targetChars: 1 });
   const ctrl = await audio.speakStream({ deferDeviceStart: true });
   tts.feed(Int16Array.from([100, -50]).buffer); // one 2-sample frame
   ctrl.begin();
@@ -1507,22 +1507,37 @@ test("the her-voice echo predicates stay false while muted with ducked music pla
   stdout.end(); await musicP;
 });
 
-test("the master volume composes with the PTT duck gain", async () => {
+test("the music volume composes with the PTT duck gain", async () => {
   const bridge = makeBridge();
   const stdout = new PassThrough();
   const proc = fakeChildFromStream(stdout);
-  const volume = createVolume({ initialPercent: 200 });
+  const volumes = { voice: createVolume({ initialPercent: 100 }), music: createVolume({ initialPercent: 200 }) };
   const audio = createAudioOut({
-    bridge, tts: {}, volume, spawn: () => proc, refGen, chunkSamples: 2, sleep: noSleep,
+    bridge, tts: {}, volumes, spawn: () => proc, refGen, chunkSamples: 2, sleep: noSleep,
     prebufferMs: 0, prebufferTimeoutMs: 1, pttDuckPercent: 50,
   });
   const musicP = audio.playUrl("http://radio");
   stdout.write(i16buf(100, -100)); await flush(10);
   audio.mute();
   stdout.write(i16buf(100, -100)); await flush(10);
-  // duck 0.5 × master 2.0 = 1.0 ⇒ unchanged samples
+  // duck 0.5 × music 2.0 = 1.0 ⇒ unchanged samples
   assert.deepEqual([bridge.bins.at(-1).readInt16LE(1), bridge.bins.at(-1).readInt16LE(3)], [100, -100]);
   audio.unmute();
+  stdout.end(); await musicP;
+});
+
+test("music frames are scaled by the MUSIC volume, not the voice volume", async () => {
+  const bridge = makeBridge();
+  const stdout = new PassThrough();
+  const proc = fakeChildFromStream(stdout);
+  const volumes = { voice: createVolume({ initialPercent: 400 }), music: createVolume({ initialPercent: 50 }) };
+  const audio = createAudioOut({
+    bridge, tts: {}, volumes, spawn: () => proc, refGen, chunkSamples: 2, sleep: noSleep,
+    prebufferMs: 0, prebufferTimeoutMs: 1,
+  });
+  const musicP = audio.playUrl("http://radio");
+  stdout.write(i16buf(100, -100)); await flush(10);
+  assert.deepEqual([bridge.bins.at(-1).readInt16LE(1), bridge.bins.at(-1).readInt16LE(3)], [50, -50]);
   stdout.end(); await musicP;
 });
 

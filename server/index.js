@@ -64,24 +64,28 @@ export async function startServer(envOverride) {
   bridge.onDeviceCommand((msg) => lightState.observe(msg));
   bridge.onDeviceConnected(() => lightState.reset());
 
-  // Master speaker volume (server-owned gain). Created unconditionally — it's
-  // independent of the agent, so the Voice-panel slider and the browser Speak
-  // path work even when Sienna is disabled. Changes (slider OR her set_volume
-  // tool) broadcast so every open slider stays in sync, and write-through to
-  // the Mongo settings store (fire-and-forget, like the autonomy toggle) so a
-  // restart restores the last set volume instead of SIENNA_VOLUME. `memory` is
-  // bound lazily — it exists only when Mongo + a reasoning provider are
-  // configured; without it the volume stays in-RAM as before. onChange can't
-  // fire before startup finishes (no browser/agent exists yet), so reading the
-  // later-declared `memory` here is safe.
-  const volume = createVolume({
+  // Speaker volumes (server-owned gains) — TWO independent channels: "voice"
+  // (her speech/TTS, browser Speak, Hold-to-talk) and "music" (jukebox /
+  // play_audio_file / play_youtube), so speech can run loud while music sits
+  // low. Created unconditionally — independent of the agent, so the Interact
+  // knobs and the browser Speak path work even when Sienna is disabled. Changes
+  // (knob OR her set_volume tool) broadcast with their channel so every open
+  // knob stays in sync, and write-through to the Mongo settings store
+  // (fire-and-forget, like the autonomy toggle) so a restart restores the last
+  // set values instead of SIENNA_VOLUME. `memory` is bound lazily — it exists
+  // only when Mongo + a reasoning provider are configured; without it the
+  // volumes stay in-RAM as before. onChange can't fire before startup finishes
+  // (no browser/agent exists yet), so reading the later-declared `memory` here
+  // is safe.
+  const channelVolume = (channel) => createVolume({
     initialPercent: config.SIENNA_VOLUME,
     maxPercent: config.SIENNA_VOLUME_MAX,
     onChange: (percent) => {
-      bridge.broadcastToBrowsers({ type: "volume", percent });
-      if (memory) Promise.resolve(memory.setSetting("volume", percent)).catch(() => {});
+      bridge.broadcastToBrowsers({ type: "volume", channel, percent });
+      if (memory) Promise.resolve(memory.setSetting(`volume_${channel}`, percent)).catch(() => {});
     },
   });
+  const volumes = { voice: channelVolume("voice"), music: channelVolume("music") };
   const recorder = new Recorder({ dir: config.RECORDINGS_DIR, keep: config.RECORDINGS_KEEP });
   await recorder.ensureDir();
 
@@ -105,7 +109,7 @@ export async function startServer(envOverride) {
   // paths (play_audio_file/play_youtube) don't. The transcriber/endpointer/beeps
   // reference it lazily for the echo gate.
   const audioOut = createAudioOut({
-    bridge, tts, volume,
+    bridge, tts, volumes,
     ffmpegPath: config.FFMPEG_PATH, ytDlpPath: config.YT_DLP_PATH,
     playerClients: config.YT_DLP_PLAYER_CLIENTS,
     musicFilter: config.SIENNA_MUSIC_FILTER,
@@ -216,7 +220,7 @@ export async function startServer(envOverride) {
   const commitBeep = createCommitBeep({
     playTone: sendPlayTone,
     isSpeaking: () => !!(audioOut && audioOut.isPlaying()),
-    volume,
+    volume: volumes.voice,   // the beeps are speech-side cues
     enabled: config.SIENNA_COMMIT_BEEP_ENABLED,
     hz: config.SIENNA_COMMIT_BEEP_HZ,
     hz2: config.SIENNA_COMMIT_BEEP_HZ2,
@@ -231,7 +235,7 @@ export async function startServer(envOverride) {
   const pttBeep = createCommitBeep({
     playTone: sendPlayTone,
     isSpeaking: () => !!(audioOut && audioOut.isPlaying()),
-    volume,
+    volume: volumes.voice,
     enabled: config.SIENNA_PTT_BEEP_ENABLED,
     hz: config.SIENNA_PTT_BEEP_HZ,
     hz2: config.SIENNA_PTT_BEEP_HZ2,
@@ -340,13 +344,18 @@ export async function startServer(envOverride) {
         onChange: ({ kind, doc }) => bridge.broadcastToBrowsers({ type: "sienna_entry", entry: toCard(kind, doc) }),
       });
 
-      // Restore the persisted master volume before the server listens (mirrors
+      // Restore the persisted channel volumes before the server listens (mirrors
       // restoreAutonomy below). setPercent clamps to SIENNA_VOLUME_MAX, so a
-      // saved value from a run with a higher cap stays safe; an unset key
-      // leaves the SIENNA_VOLUME default.
+      // saved value from a run with a higher cap stays safe; an unset key falls
+      // back to the pre-split "volume" master key (seamless upgrade), then to
+      // the SIENNA_VOLUME default.
       try {
-        const savedVolume = await memory.getSetting("volume", null);
-        if (savedVolume != null) volume.setPercent(savedVolume);
+        const legacyVolume = await memory.getSetting("volume", null);
+        for (const channel of ["voice", "music"]) {
+          const saved = await memory.getSetting(`volume_${channel}`, null);
+          const value = saved ?? legacyVolume;
+          if (value != null) volumes[channel].setPercent(value);
+        }
       } catch { /* leave the configured default */ }
 
       // Restore the persisted music-pacing slider value (same pattern as volume).
@@ -438,7 +447,7 @@ export async function startServer(envOverride) {
         endConversationAndStop: () => { if (jukebox) jukebox.stop(); audioOut.hardStop(); ptt.endNow(); },
       };
       const tools = createToolRegistry({
-        memory, deviceRpc, audioOut, vision, micListener, volume, weather, jukebox, stopController,
+        memory, deviceRpc, audioOut, vision, micListener, volumes, weather, jukebox, stopController,
         speakListen: {
           enabled: config.SIENNA_SPEAK_LISTEN,
           seconds: config.SIENNA_SPEAK_LISTEN_SECONDS,
@@ -593,9 +602,11 @@ export async function startServer(envOverride) {
   const wssBrowser = new WebSocketServer({ noServer: true });
 
   attachDeviceWs(wssDevice, bridge, recorder, transcriber, config.DASHBOARD_TOKEN, config.DEBUG_DEVICE_WS, config.DEVICE_HEARTBEAT_MS, micListener);
-  attachBrowserWs(wssBrowser, bridge, config.DASHBOARD_TOKEN, recorder, transcriber, micStream, agent, volume, audioOut,
+  attachBrowserWs(wssBrowser, bridge, config.DASHBOARD_TOKEN, recorder, transcriber, micStream, agent, volumes, audioOut,
     // Connect-time now-playing push (the jukebox may be null when the agent is off).
-    () => nowPlayingMsg(jukebox));
+    () => nowPlayingMsg(jukebox),
+    // On-screen PTT button — same coordinator as the physical GPIO 45 button.
+    ptt);
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, "http://x");

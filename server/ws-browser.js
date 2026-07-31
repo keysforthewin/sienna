@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 const ACK_TIMEOUT_MS = 5000;
 
-export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micStream, agent = null, volume = null, audioOut = null, getNowPlaying = null) {
+export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micStream, agent = null, volumes = null, audioOut = null, getNowPlaying = null, ptt = null) {
   wss.on("connection", (ws, req) => {
     const url = new URL(req.url, "http://x");
     const sentToken = url.searchParams.get("token");
@@ -21,11 +21,15 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
       try { ws.send(JSON.stringify({ type: "autonomy_state", enabled: agent.getAutonomy() })); } catch {}
     }
 
-    // Tell this browser the current master volume so the Voice-panel slider shows
-    // the live value (set by an earlier browser or by Sienna's set_volume tool)
-    // rather than its markup default.
-    if (volume) {
-      try { ws.send(JSON.stringify({ type: "volume", percent: volume.getPercent(), max: volume.maxPercent() })); } catch {}
+    // Tell this browser the current channel volumes (voice + music) so the
+    // Interact-page knobs show the live values (set by an earlier browser or by
+    // Sienna's set_volume tool) rather than their markup defaults.
+    if (volumes) {
+      for (const channel of ["voice", "music"]) {
+        const v = volumes[channel];
+        if (!v) continue;
+        try { ws.send(JSON.stringify({ type: "volume", channel, percent: v.getPercent(), max: v.maxPercent() })); } catch {}
+      }
     }
 
     // Likewise the live music-pacing slider value + its bounds (server-owned, shared).
@@ -55,6 +59,13 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
 
     // Unique token so this browser's listen hold is independent of others'.
     const listenToken = `listen:${randomUUID()}`;
+
+    // Is THIS browser mid-hold on the on-screen PTT button? Tracked so a tab
+    // that closes/crashes during a hold releases the coordinator (mirrors the
+    // device path's disconnect reset).
+    let pttDown = false;
+    const broadcastPttEdge = (pressed) =>
+      bridge.broadcastToBrowsers({ type: "button", id: "ptt", pressed, ts_ms: Date.now(), source: "browser" });
 
     // Track outstanding refs for ack timeout reporting
     const pendingAcks = new Map(); // ref -> timer
@@ -97,9 +108,9 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
         // PCM at all — browser-originated audio (Voice-panel Speak, Hold-to-talk)
         // included. Dropped silently (not an error: the stream keeps flowing).
         if (audioOut && audioOut.isMuted && audioOut.isMuted()) return;
-        // Browser-originated speaker PCM (Voice-panel Speak, Hold-to-talk). Apply
-        // the master volume here so it matches the agent's speak path (audio-out.js).
-        const buf = volume ? volume.applyGain(Buffer.from(data)) : Buffer.from(data);
+        // Browser-originated speaker PCM (Voice-panel Speak, Hold-to-talk) is
+        // speech — apply the VOICE volume so it matches her speak path (audio-out.js).
+        const buf = volumes?.voice ? volumes.voice.applyGain(Buffer.from(data)) : Buffer.from(data);
         const tagged = Buffer.concat([Buffer.from([BinTag.PLAYBACK_PCM]), buf]);
         const ok = bridge.sendBinaryToDevice(tagged);
         if (!ok) {
@@ -131,12 +142,36 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
         ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
         return;
       }
-      // Master speaker volume: consumed server-side (the gain is applied to
-      // outgoing PCM here and in audio-out.js); never forwarded to the device.
-      // The volume module's onChange broadcasts the new value to every browser,
-      // so all open sliders — including this one — stay in sync.
+      // Speaker volume: consumed server-side (the gain is applied to outgoing
+      // PCM here and in audio-out.js); never forwarded to the device. A channel
+      // ("voice"/"music") targets one gain; omitted, both are set (legacy
+      // master). Each volume's onChange broadcasts the new value to every
+      // browser, so all open knobs — including this one — stay in sync.
       if (msg.type === "set_volume") {
-        if (volume) volume.setPercent(msg.percent);
+        if (volumes) {
+          const targets = msg.channel ? [volumes[msg.channel]] : [volumes.voice, volumes.music];
+          for (const v of targets) v?.setPercent(msg.percent);
+        }
+        ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
+        return;
+      }
+      // On-screen push-to-talk: drives the SAME coordinator as the device's
+      // physical button. The mic that opens is the DEVICE mic, so a press with
+      // no device is refused up front; a release always goes through (it can
+      // only clear state). Re-broadcast as a device-shaped button event so
+      // every open Speech panel's "listening" light reacts.
+      if (msg.type === "ptt") {
+        if (!ptt) {
+          ws.send(JSON.stringify({ type: "command_error", ref: browserRef, reason: "ptt_unavailable" }));
+          return;
+        }
+        if (msg.pressed && !bridge.hasDevice()) {
+          ws.send(JSON.stringify({ type: "command_error", ref: browserRef, reason: "device_offline" }));
+          return;
+        }
+        pttDown = msg.pressed;
+        ptt.onButton(msg.pressed);
+        broadcastPttEdge(msg.pressed);
         ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
         return;
       }
@@ -226,6 +261,13 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
 
     ws.on("close", () => {
       micStream.release(listenToken);
+      // Tab vanished mid-hold: release the coordinator so the mic doesn't stay
+      // pinned open until the max-hold cap.
+      if (pttDown && ptt) {
+        pttDown = false;
+        try { ptt.onButton(false); } catch {}
+        broadcastPttEdge(false);
+      }
       for (const { timer } of pendingAcks.values()) clearTimeout(timer);
       pendingAcks.clear();
     });

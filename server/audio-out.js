@@ -42,7 +42,9 @@ const SAMPLE_RATE = 16000;
 export function createAudioOut({
   bridge,
   tts,
-  volume = null,        // master speaker gain (volume.js); null ⇒ unity passthrough
+  volumes = null,       // per-channel speaker gains {voice, music} (volume.js
+                        // instances); null ⇒ unity passthrough. voice covers her
+                        // speech/TTS paths, music the jukebox/file/YouTube paths.
   duckPercent = 20,     // music bed level under her voice (percent of full); 0 ⇒ duck off
                         // (music drops silently under voice, the pre-duck behavior)
   pttDuckPercent = 0,   // music level while the PTT button is held (percent of full).
@@ -248,7 +250,21 @@ export function createAudioOut({
   // voice didn't already have — it's a sidechain duck (her level dips ~duckGain
   // where the bed plays). Consumes the queue front; a short queue leaves the tail of
   // the frame pure voice (the bed dips out — no glitch). The clamp stays as defense.
-  function mixDuck(bytes) {
+  // The bed is mixed INTO voice frames, so it later receives the VOICE channel
+  // gain — with independent channel volumes a quiet music setting would be
+  // ignored during ducking. Compensate: scale the bed term toward
+  // duckGain·(music/voice), never ABOVE duckGain (staying ≤ duckGain keeps the
+  // convex blend's no-new-clipping bound — when music is set louder than voice
+  // the bed simply stays at the classic duck level).
+  function bedGain() {
+    if (!volumes?.voice || !volumes?.music) return duckGain;
+    const v = volumes.voice.getPercent();
+    const m = volumes.music.getPercent();
+    if (v <= 0 || m >= v) return duckGain;
+    return duckGain * (m / v);
+  }
+
+  function mixDuck(bytes, bed = duckGain) {
     const out = Buffer.from(bytes);
     let off = 0;
     while (off + 1 < out.length && duckQueue.length) {
@@ -256,7 +272,7 @@ export function createAudioOut({
       if (head.length < 2) { duckQueueBytes -= head.length; duckQueue.shift(); continue; }
       const n = Math.min(out.length - off, head.length) & ~1;   // whole int16 samples
       for (let i = 0; i < n; i += 2) {
-        let v = Math.round(out.readInt16LE(off + i) * (1 - duckGain) + head.readInt16LE(i) * duckGain);
+        let v = Math.round(out.readInt16LE(off + i) * (1 - duckGain) + head.readInt16LE(i) * bed);
         if (v > 32767) v = 32767;
         else if (v < -32768) v = -32768;
         out.writeInt16LE(v, off + i);
@@ -330,9 +346,10 @@ export function createAudioOut({
     }
     if (ch.playStartedAt === null) ch.playStartedAt = clock();
     ch.sentSamples += bytes.length >> 1;  // 16-bit mono ⇒ 2 bytes/sample
-    let mixed = ch === voice && duckGain > 0 && duckQueueBytes > 0 ? mixDuck(bytes) : bytes;
+    let mixed = ch === voice && duckGain > 0 && duckQueueBytes > 0 ? mixDuck(bytes, bedGain()) : bytes;
     if (muted && ch === music) mixed = scalePcm(mixed, pttDuckGain);   // the PTT duck
-    const scaled = volume ? volume.applyGain(mixed) : mixed;
+    const vol = volumes ? (ch === music ? volumes.music : volumes.voice) : null;
+    const scaled = vol ? vol.applyGain(mixed) : mixed;
     const buf = Buffer.allocUnsafe(1 + scaled.length);
     buf[0] = BinTag.PLAYBACK_PCM;
     scaled.copy(buf, 1);

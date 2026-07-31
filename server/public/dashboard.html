@@ -18,6 +18,7 @@
       <button class="view-tab" data-view="io" role="tab" aria-selected="true">Diagnostics</button>
       <button class="view-tab" data-view="sienna" role="tab" aria-selected="false">Interact</button>
       <button class="view-tab" data-view="usage" role="tab" aria-selected="false">Usage</button>
+      <button class="view-tab" data-view="logs" role="tab" aria-selected="false">Logs</button>
     </div>
 
     <div class="status-cluster">
@@ -94,6 +95,11 @@
         <h2>Voice</h2>
         <div>(voice panel placeholder)</div>
       </section>
+
+      <section class="panel" id="panel-autonomy">
+        <h2>Agent</h2>
+        <div>(agent settings placeholder)</div>
+      </section>
     </div>
 
     <!-- Full-width camera below both columns. -->
@@ -103,9 +109,10 @@
     </section>
   </main>
 
-  <!-- AREA 2 — Sienna. Hidden until selected. Full-bleed: no outer card. The
-       panel renders the composer + speech monitor + autonomy on top, then the tabs,
-       then a newest-on-top infinite-scroll feed. -->
+  <!-- AREA 2 — Sienna (Interact). Hidden until selected. Full-bleed: no outer
+       card. The panel renders the composer + speech monitor (with the on-screen
+       Push to talk button) + the two volume knobs. The history tabs/feeds live
+       in AREA 4 (Logs); the autonomy toggle lives on Diagnostics. -->
   <main id="view-sienna" class="view sienna-view" hidden>
     <section id="panel-sienna">
       <div>(Sienna agent panel placeholder)</div>
@@ -118,6 +125,17 @@
   <main id="view-usage" class="view usage-view" hidden>
     <section id="panel-usage">
       <div>(Usage panel placeholder)</div>
+    </section>
+  </main>
+
+  <!-- AREA 4 — Logs. Hidden until selected. Sienna's full history: the
+       Activity / Messages / Memories / Personality History / Tool Calls / Images
+       tab strip + feeds, mounted here by sienna.js (the Interact page keeps just
+       the composer + speech monitor + volume knobs). REST-backed, usable while
+       the device is offline. -->
+  <main id="view-logs" class="view logs-view" hidden>
+    <section id="panel-sienna-logs">
+      <div>(Sienna logs placeholder)</div>
     </section>
   </main>
 

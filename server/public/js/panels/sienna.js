@@ -1,7 +1,12 @@
-// "Sienna" view: her input (send box + speech monitor + autonomy) on top, then six
-// tabs — Activity (a time-merged feed of messages + memories + personality +
-// tool calls + images), Messages, Memories, Personality History, Tool Calls,
-// Images — over a vertical feed. Tool calls render live and are persisted (so
+// "Sienna" panels, mounted across TWO views:
+//   - Interact (#panel-sienna): her input — send box + speech monitor (with the
+//     on-screen Push to talk button) + the two volume knobs (mounted into
+//     #sienna-knobs by volume-knobs.js). The autonomy toggle lives on the
+//     Diagnostics view (panels/autonomy.js).
+//   - Logs (#panel-sienna-logs): six tabs — Activity (a time-merged feed of
+//     messages + memories + personality + tool calls + images), Messages,
+//     Memories, Personality History, Tool Calls, Images — over a vertical feed.
+// Tool calls render live and are persisted (so
 // they backfill on reload); output-device calls (speaker / LEDs) get a special
 // graphic, and image cards render an inline thumbnail.
 // Newest is at the TOP; new entries auto-prepend (and, when you're
@@ -26,7 +31,8 @@ const MAX = 500;          // server clamp on ?limit; the infinite-scroll ceiling
 
 export function initSiennaPanel(client) {
   const root = document.getElementById("panel-sienna");
-  if (!root) return;
+  const logsRoot = document.getElementById("panel-sienna-logs");
+  if (!root || !logsRoot) return;
 
   root.innerHTML = `
     <div id="sienna-nowplaying" class="sienna-nowplaying" hidden>
@@ -39,20 +45,23 @@ export function initSiennaPanel(client) {
     </div>
     <div id="sienna-speech" class="sienna-speech"></div>
     <div class="sienna-controls">
-      <label class="sienna-toggle">
-        <input type="checkbox" id="sienna-autonomy"> Autonomous speech
-      </label>
+      <div id="sienna-knobs" class="sienna-knobs"></div>
       <span id="sienna-status" class="sienna-status"></span>
     </div>
+  `;
+
+  // The history lives on the Logs view. Hidden views keep their JS alive
+  // (`hidden` attribute, not teardown), so live entries keep prepending while
+  // the Logs tab isn't showing.
+  logsRoot.innerHTML = `
     <div class="sienna-tabs" id="sienna-tabs"></div>
     <div id="sienna-feeds"></div>
   `;
 
-  const tabsBar = root.querySelector("#sienna-tabs");
-  const feedsWrap = root.querySelector("#sienna-feeds");
+  const tabsBar = logsRoot.querySelector("#sienna-tabs");
+  const feedsWrap = logsRoot.querySelector("#sienna-feeds");
   const input = root.querySelector("#sienna-input");
   const sendBtn = root.querySelector("#sienna-send");
-  const autonomy = root.querySelector("#sienna-autonomy");
   const statusEl = root.querySelector("#sienna-status");
   const npBar = root.querySelector("#sienna-nowplaying");
   const npText = root.querySelector("#sienna-np-text");
@@ -284,7 +293,6 @@ export function initSiennaPanel(client) {
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
-  autonomy.addEventListener("change", () => client.send({ type: "set_autonomy", enabled: autonomy.checked }));
 
   // ---- live events ----
   client.addEventListener("msg:sienna_entry", (ev) => {
@@ -327,7 +335,6 @@ export function initSiennaPanel(client) {
     statusEl.textContent = ev.detail.state === "thinking" ? "thinking…" : "";
   });
   client.addEventListener("msg:agent_error", (ev) => { statusEl.textContent = `error: ${ev.detail.reason}`; });
-  client.addEventListener("msg:autonomy_state", (ev) => { autonomy.checked = !!ev.detail.enabled; });
   client.addEventListener("msg:command_error", (ev) => {
     if (ev.detail.reason === "agent_unavailable") {
       statusEl.textContent = "Sienna's agent isn't configured (needs MongoDB + Gemini).";
@@ -337,7 +344,7 @@ export function initSiennaPanel(client) {
   // Refresh the relative timestamps in place.
   setInterval(() => {
     const now = Date.now();
-    root.querySelectorAll(".sienna-feed-time[data-ts]").forEach((el) => {
+    logsRoot.querySelectorAll(".sienna-feed-time[data-ts]").forEach((el) => {
       el.textContent = relTime(Number(el.dataset.ts), now);
     });
   }, 30000);

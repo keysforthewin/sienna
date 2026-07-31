@@ -1,12 +1,13 @@
-// Header view-switcher: toggles the two top-level areas (Input/Output vs Sienna).
-// A pure DOM-visibility toggle via the `hidden` attribute — panels inside the
-// hidden view keep their JS state and animation loops alive (display:none just
-// stops them painting), so switching back is instant and nothing re-inits. The
-// last-selected view is persisted in localStorage, mirroring the volume-slider
-// pattern. The `.view-tab` buttons are whitelisted in dashboard.js's
-// disableAllControls so they stay clickable when the device goes offline.
+// Header view-switcher: toggles the top-level areas (Diagnostics / Interact /
+// Usage / Logs). A pure DOM-visibility toggle via the `hidden` attribute —
+// panels inside the hidden view keep their JS state and animation loops alive
+// (display:none just stops them painting), so switching back is instant and
+// nothing re-inits. The last-selected view is persisted in localStorage,
+// mirroring the volume-knob pattern. The `.view-tab` buttons are whitelisted in
+// dashboard.js's disableAllControls so they stay clickable when the device goes
+// offline.
 const VIEW_KEY = "sienna.view";
-const VIEWS = ["io", "sienna", "usage"];
+const VIEWS = ["io", "sienna", "usage", "logs"];
 
 export function initViews() {
   const tabs = Array.from(document.querySelectorAll(".view-tab"));
@@ -14,8 +15,9 @@ export function initViews() {
     io:     document.getElementById("view-io"),
     sienna: document.getElementById("view-sienna"),
     usage:  document.getElementById("view-usage"),
+    logs:   document.getElementById("view-logs"),
   };
-  if (!tabs.length || !panes.io || !panes.sienna || !panes.usage) return;
+  if (!tabs.length || VIEWS.some((v) => !panes[v])) return;
 
   let current = localStorage.getItem(VIEW_KEY);
   if (!VIEWS.includes(current)) current = "io";

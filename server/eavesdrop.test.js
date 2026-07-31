@@ -100,6 +100,33 @@ test("listening and hearing silence still counts as the day's eavesdrop (rate-li
   assert.equal(listens.length, 1); // did NOT re-listen within the day
 });
 
+// Scribe can "hear" non-speech: punctuation-only commits ("...") or bracketed
+// sound-effect annotations ("(door closes)"). None of these are anyone talking,
+// so they must not route a turn — but they DO count as the day's eavesdrop.
+for (const junk of ["...", "  . , !  ", "(door closes)", "[music]", "(applause) …", "   "]) {
+  test(`a transcript with no real words (${JSON.stringify(junk)}) routes nothing`, async () => {
+    const { e, calls, listens, runs, setNow } = make({
+      listenResult: { ok: true, heardSpeech: true, transcript: junk },
+    });
+    e.start();
+    await calls[0].fn();
+    assert.equal(runs.length, 0);
+    setNow(60000);
+    await calls[calls.length - 1].fn();
+    assert.equal(listens.length, 1); // still counted as today's eavesdrop
+  });
+}
+
+test("a transcript with real words among annotations still routes", async () => {
+  const { e, calls, runs } = make({
+    listenResult: { ok: true, heardSpeech: true, transcript: "(door closes) see you tomorrow" },
+  });
+  e.start();
+  await calls[0].fn();
+  assert.equal(runs.length, 1);
+  assert.match(runs[0].input, /see you tomorrow/);
+});
+
 test("a conversation starting mid-window drops the overheard transcript", async () => {
   const { e, calls, runs } = make({ onListen: (f) => { f.busy = true; } });
   e.start();

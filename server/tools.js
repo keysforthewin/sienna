@@ -13,7 +13,7 @@ function ok(content) { return { content: String(content) }; }
 function err(content) { return { content: String(content), is_error: true }; }
 
 export function createToolRegistry({
-  memory, deviceRpc, audioOut, vision, micListener, volume, weather, jukebox,
+  memory, deviceRpc, audioOut, vision, micListener, volumes, weather, jukebox,
   // After the speak TOOL plays, flash the blue LED and open the mic briefly to
   // catch a reply. Degrades to plain speak when micListener is null or disabled.
   speakListen = { enabled: false, seconds: 10, drainCapMs: 4000 },
@@ -290,15 +290,26 @@ export function createToolRegistry({
       def: {
         name: "set_volume",
         description:
-          "Set how loud your voice and audio come out of your speaker, as a percentage. " +
+          "Set how loud you come out of your speaker, as a percentage. " +
           "100 is normal; go higher if you're told you're too quiet (up to 400), lower if you're too loud. " +
-          "This is your master speaker volume — it takes effect immediately and stays until you change it again.",
-        input_schema: { type: "object", properties: { percent: { type: "integer", minimum: 0, maximum: 400 } }, required: ["percent"] },
+          "There are two independent channels: 'voice' (your spoken voice) and 'music' (the jukebox / " +
+          "YouTube / audio-file playback) — so your voice can stay loud while music sits at a lower level. " +
+          "Pass channel to adjust one; omit it (or pass 'both') to set both at once. " +
+          "Takes effect immediately and stays until changed again.",
+        input_schema: {
+          type: "object",
+          properties: {
+            percent: { type: "integer", minimum: 0, maximum: 400 },
+            channel: { type: "string", enum: ["voice", "music", "both"] },
+          },
+          required: ["percent"],
+        },
       },
       run: async (input) => {
-        if (!volume) return err("volume control isn't available right now");
-        const p = volume.setPercent(input.percent);
-        return ok(`volume set to ${p}%`);
+        if (!volumes?.voice || !volumes?.music) return err("volume control isn't available right now");
+        const chans = input.channel && input.channel !== "both" ? [input.channel] : ["voice", "music"];
+        const set = chans.map((c) => `${c} ${volumes[c].setPercent(input.percent)}%`);
+        return ok(`volume set: ${set.join(", ")}`);
       },
     },
 

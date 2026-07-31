@@ -172,11 +172,21 @@ export const SetAutonomyCmd = z.object({
   type: z.literal("set_autonomy"), ref: ref,
   enabled: z.boolean(),
 });
-// Consumed server-side: the master speaker volume / gain (see volume.js). Never
-// forwarded to the device — the firmware has no volume control.
+// Consumed server-side: a speaker volume / gain (see volume.js). Never
+// forwarded to the device — the firmware has no volume control. Two independent
+// channels ("voice" = her speech/TTS, "music" = jukebox/YouTube); omitting
+// `channel` sets both (the legacy master semantics).
 export const SetVolumeCmd = z.object({
   type: z.literal("set_volume"), ref: ref,
   percent: z.number().int().min(0).max(400),
+  channel: z.enum(["voice", "music"]).optional(),
+});
+// Consumed server-side: the dashboard's on-screen push-to-talk button. Drives
+// the SAME coordinator as the device's physical GPIO 45 button (the mic that
+// opens is still the DEVICE mic); never forwarded to the device.
+export const PttCmd = z.object({
+  type: z.literal("ptt"), ref: ref,
+  pressed: z.boolean(),
 });
 // Consumed server-side: the music-playback pacing knob (ms between frames; see
 // audio-out.js, which clamps to its own [MIN,MAX]). Never forwarded to the device.
@@ -200,6 +210,7 @@ export const BrowserMsg = z.discriminatedUnion("type", [
   SnapshotCmd, RebootCmd,
   ScanWifiCmd, ScanBleCmd, SetTimerCmd, CancelTimerCmd,
   AgentInputCmd, SetAutonomyCmd, SetVolumeCmd, SetMusicPacingCmd, SetTtsPacingCmd,
+  PttCmd,
 ]);
 
 export function parseDeviceMessage(raw) {

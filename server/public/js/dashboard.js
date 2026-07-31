@@ -10,6 +10,8 @@ import { initListenPanel } from "/js/panels/listen.js";
 import { initSiennaPanel } from "/js/panels/sienna.js";
 import { initUsagePanel } from "/js/panels/usage.js";
 import { initViews } from "/js/panels/views.js";
+import { initAutonomyPanel } from "/js/panels/autonomy.js";
+import { initVolumeKnobs } from "/js/panels/volume-knobs.js";
 
 const URL_KEY = "sienna.wsUrl";
 const TOKEN_KEY = "sienna.token";
@@ -73,10 +75,12 @@ function disableAllControls(disabled) {
     // The Usage view is REST-backed (token usage/cost), independent of the device,
     // so its granularity buttons stay usable offline — like the Sienna tabs.
     if (el.classList.contains("usage-tab")) return;
-    // The volume slider is server-side state (Sienna's tool shares it), so it
-    // stays usable offline — like settings — rather than greying out with the device.
-    if (el.id === "tts-volume") return;
-    // The music-pacing slider is likewise a server-owned playback knob (shared +
+    // The autonomy toggle is server-side agent state (persisted in Mongo), so it
+    // stays usable offline — like settings — rather than greying out with the
+    // device. (The volume knobs are role=slider divs, untouched by this sweep,
+    // and server-side too.)
+    if (el.id === "sienna-autonomy") return;
+    // The music-pacing slider is a server-owned playback knob (shared +
     // persisted), so it stays usable offline too.
     if (el.id === "tts-music-pacing") return;
     // The voice (TTS) pacing slider is the same kind of server-owned knob.
@@ -140,10 +144,13 @@ function setupSettings(client, currentToken) {
   initCameraPanel(client);
   initLoopback(client);     // …which initLoopback then wires for mic capture
   initListenPanel(client);
-  initSiennaPanel(client);
+  initSiennaPanel(client);  // Interact composer + the Logs-view feeds…
+  initVolumeKnobs(client);  // …then the knobs mount into its #sienna-knobs
+  initAutonomyPanel(client);// Autonomous-speech toggle (Diagnostics view)
   initUsagePanel(client);   // the Usage view (Gemini token usage + cost)
 
-  // The speech monitor lives on the Sienna tab (shows PTT holds + transcripts).
+  // The speech monitor lives on the Interact tab (shows PTT holds + transcripts,
+  // and hosts the on-screen Push to talk button).
   mountSpeech(client, document.getElementById("sienna-speech"), { rows: 3 });
 
   client.addEventListener("open", () => setServer(true));

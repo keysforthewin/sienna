@@ -35,12 +35,6 @@ export function initTtsPanel(client) {
       <span id="tts-status" style="color: var(--muted);"></span>
       <span id="ptt-status" style="color: var(--muted);"></span>
     </div>
-    <div class="volume-row" style="margin-top: 10px; display: flex; gap: 8px; align-items: center;">
-      <label for="tts-volume" style="color: var(--muted); min-width: 3.5em;">Volume</label>
-      <input id="tts-volume" type="range" min="0" max="400" step="5" value="200"
-        title="Sienna's master speaker volume" style="flex: 1; min-width: 120px;" />
-      <span id="tts-volume-val" style="color: var(--muted); width: 3.2em; text-align: right;">200%</span>
-    </div>
     <div class="pacing-row" style="margin-top: 10px; display: flex; gap: 8px; align-items: center;">
       <label for="tts-music-pacing" style="color: var(--muted); min-width: 3.5em;">Music pace</label>
       <input id="tts-music-pacing" type="range" min="80" max="136" step="1" value="128"
@@ -138,27 +132,8 @@ export function initTtsPanel(client) {
     }
   });
 
-  // Master speaker volume slider. The value is server-owned (Sienna can change it
-  // with her set_volume tool, and other browsers' sliders share it), so the
-  // server is the source of truth: we send on input and reflect broadcasts +
-  // the on-connect snapshot. Works while the device is offline — the gain is
-  // applied server-side regardless (see disableAllControls' whitelist).
-  const volumeEl = root.querySelector("#tts-volume");
-  const volumeValEl = root.querySelector("#tts-volume-val");
-  const renderVolume = (p) => { volumeValEl.textContent = `${p}%`; };
-  volumeEl.addEventListener("input", () => {
-    const percent = +volumeEl.value;
-    renderVolume(percent);
-    client.send({ type: "set_volume", percent });
-  });
-  client.addEventListener("msg:volume", (ev) => {
-    const m = ev.detail || {};
-    if (typeof m.max === "number") volumeEl.max = String(m.max);
-    if (typeof m.percent === "number") {
-      volumeEl.value = String(m.percent);
-      renderVolume(m.percent);
-    }
-  });
+  // (The speaker volume moved to the Interact page — two per-channel knobs; see
+  // panels/volume-knobs.js.)
 
   // Music-pacing slider. Server-owned playback knob (ms between music frames), shared
   // across browsers and persisted; like volume it stays usable while the device is

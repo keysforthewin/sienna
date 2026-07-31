@@ -1,10 +1,14 @@
-// Speech monitor widget. Voice input is the device's physical push-to-talk
-// button only — this panel just SHOWS it happening: a live indicator while the
-// button is held (driven by the broadcast {type:"button",id:"ptt",pressed}
-// device events), interim words as they arrive (greyed), and each finalized
-// phrase prepended as a timestamped row to a scrollable log. Nothing here sends
-// audio or starts transcription — the server's PTT coordinator collects the
-// hold's transcripts and routes them to Sienna when the button is released.
+// Speech monitor widget. Voice input is push-to-talk: the device's physical
+// button, or this panel's on-screen "Push to talk" button — hold it and the
+// server drives the SAME coordinator (the mic that opens is the DEVICE mic, so
+// you still talk to Sienna herself). The panel shows it happening: a live
+// indicator while either button is held (driven by the broadcast
+// {type:"button",id:"ptt",pressed} events), interim words as they arrive
+// (greyed), and each finalized phrase prepended as a timestamped row to a
+// scrollable log. Each press marks the log for clearing — the old text stays
+// visible until the NEW hold's first words arrive, then the log resets to just
+// them. Nothing here sends audio — the server's PTT coordinator collects the
+// hold's transcripts and routes them to Sienna on release.
 // Uses local element refs (no global ids) so it can be mounted more than once.
 
 import { DISPLAY_TZ } from "./sienna-strip.js";
@@ -23,7 +27,7 @@ export function mountSpeech(client, container, opts = {}) {
     <div class="speech-interim"></div>
     <div class="speech-log"><div class="speech-log-list"></div></div>
     <div class="speech-actions">
-      <button class="speech-clear">Clear</button>
+      <button class="speech-ptt" title="Hold to talk to Sienna (uses her device mic)">🎙 Push to talk</button>
     </div>
   `;
 
@@ -33,7 +37,7 @@ export function mountSpeech(client, container, opts = {}) {
   const interimEl = container.querySelector(".speech-interim");
   const logEl = container.querySelector(".speech-log");
   const listEl = container.querySelector(".speech-log-list");
-  const clearBtn = container.querySelector(".speech-clear");
+  const pttBtn = container.querySelector(".speech-ptt");
 
   const setStatus = (s) => { statusEl.textContent = s; };
 
@@ -57,10 +61,41 @@ export function mountSpeech(client, container, opts = {}) {
     if (!atTop) logEl.scrollTop += row.offsetHeight;
   };
 
-  clearBtn.addEventListener("click", () => {
-    listEl.replaceChildren();
-    interimEl.textContent = "";
+  // ---- on-screen push-to-talk ----
+  // Hold-to-talk semantics, mirroring the physical button: press edge sends
+  // {type:"ptt", pressed:true}, release sends false, and the server drives the
+  // same coordinator (mute → listen beep → transcribe → route on release).
+  // Every press marks the log to clear as soon as this hold's first words
+  // arrive (final or interim) — replacing the old dedicated Clear button.
+  let pendingClear = false;
+  let held = false;
+  const sendEdge = (pressed) => {
+    if (pressed === held) return;                 // dedupe (pointer + key combos)
+    held = pressed;
+    pttBtn.classList.toggle("holding", pressed);
+    if (pressed) pendingClear = true;
+    client.send({ type: "ptt", pressed });
+  };
+  pttBtn.addEventListener("pointerdown", (e) => {
+    if (pttBtn.disabled) return;
+    e.preventDefault();
+    try { pttBtn.setPointerCapture(e.pointerId); } catch { /* capture is best-effort */ }
+    sendEdge(true);
   });
+  pttBtn.addEventListener("pointerup", () => sendEdge(false));
+  pttBtn.addEventListener("pointercancel", () => sendEdge(false));
+  pttBtn.addEventListener("contextmenu", (e) => e.preventDefault()); // touch long-press
+  // Keyboard hold: Space/Enter down = press, up = release (suppress the native
+  // click-on-space so it can't double-fire).
+  pttBtn.addEventListener("keydown", (e) => {
+    if (e.key !== " " && e.key !== "Enter") return;
+    e.preventDefault();
+    if (!e.repeat) sendEdge(true);
+  });
+  pttBtn.addEventListener("keyup", (e) => {
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); sendEdge(false); }
+  });
+  pttBtn.addEventListener("blur", () => sendEdge(false));
 
   // ---- PTT held indicator ----
   // Driven by the forwarded device button events. A safety timer (just past the
@@ -96,6 +131,13 @@ export function mountSpeech(client, container, opts = {}) {
   client.addEventListener("msg:transcript", (ev) => {
     const { final, text } = ev.detail;
     if (!text) return;
+    // The first words after a Push-to-talk press replace the previous hold's
+    // text — the log clears exactly when new text arrives, never sooner.
+    if (pendingClear) {
+      pendingClear = false;
+      listEl.replaceChildren();
+      interimEl.textContent = "";
+    }
     if (final) {
       appendFinal(text);
       interimEl.textContent = "";

@@ -132,11 +132,18 @@ any consumer holds it).
 
 #### Voice → Sienna (push-to-talk → the agent)
 
-Speech reaches the agent only while the user holds the device's PTT button —
-the dashboard has no voice-input control (the Speech panel is a read-only
-monitor: a "listening" indicator driven by the broadcast `button` events, live
-interim words, and a log of finalized phrases). The chain and its non-obvious
-correctness pieces:
+Speech reaches the agent only while a PTT button is held — the device's
+physical button, or the Speech panel's on-screen **Push to talk** button
+(Interact page): the browser sends `{type:"ptt", pressed}` (`PttCmd`),
+`ws-browser.js` drives the SAME coordinator via `ptt.onButton` and re-broadcasts
+a device-shaped `button` event so every panel's "listening" light reacts. The
+mic that opens is still the DEVICE mic; a press with no device is refused
+(`device_offline`), and a browser that closes mid-hold auto-releases. The
+Speech panel otherwise monitors: the listening indicator (broadcast `button`
+events), live interim words, and a log of finalized phrases — each on-screen
+press marks the log to clear when the NEW hold's first words arrive (this
+replaced the old Clear button). The chain and its non-obvious correctness
+pieces:
 
 - **PTT coordinator** (`server/ptt.js`, `createPttCoordinator`; built
   unconditionally in `index.js`). Device `{type:"button", id:"ptt", pressed}`
@@ -240,20 +247,28 @@ HTTP `/stream` eleven_v3 path; the browser just sends text and shows status, no
 client-side decode/resample). It also hosts the
 **Hold to talk** loopback button (the `#ptt` mic→speaker passthrough wired by
 `loopback.js`), relocated here from the Audio panel — `loopback.js` finds `#ptt`
-by global id, so the move was markup-only. A **Volume** slider here drives the
-master speaker volume — a server-owned gain (`server/volume.js`) applied to
-**every** PCM frame the server forwards to the device, since the firmware plays
-PCM verbatim (no device-side gain). It's threaded into `audio-out.js` (her speak /
-file / YouTube paths) and `ws-browser.js`'s binary handler (browser-originated
-Speak + Hold-to-talk), set live by the slider's `set_volume` message **and**
-Sienna's `set_volume` tool, with an `onChange` broadcast (`{type:"volume"}`) so
-every open slider stays in sync (incl. when she changes it). Created
-unconditionally (independent of the agent), default `SIENNA_VOLUME` (200%), clamp
-`0…SIENNA_VOLUME_MAX` (400%). When Mongo-backed memory exists, every change is
-write-through persisted to the `settings` store and restored at boot (before the
-server listens), so the last set volume **survives restarts**; without Mongo it
-stays in-RAM and resets to the default. The slider is whitelisted
-in `disableAllControls` (server-side state, usable while the device is offline).
+by global id, so the move was markup-only. The speaker volume lives on the
+**Interact** page as two rotary **knobs** (`panels/volume-knobs.js`, mounted
+into `#sienna-knobs`; SVG dials — drag/wheel/arrow keys, double-click = 100%):
+**Speech** and **Music** are INDEPENDENT server-owned gains (two
+`server/volume.js` instances, `volumes.voice` / `volumes.music` in `index.js`)
+so her voice can run loud while music stays low. voice covers `audio-out.js`'s
+speak/streamed-reply paths + `ws-browser.js`'s binary handler (browser Speak +
+Hold-to-talk) + the beep amplitudes; music covers jukebox /
+`play_audio_file` / `play_youtube` (and the duck bed compensates so a quiet
+music setting holds through ducking, capped at `duckGain`). Set live by
+`set_volume` (`channel:"voice"|"music"`; channel omitted = both — legacy
+master semantics, which is also how Sienna's `set_volume` tool defaults; the
+tool takes `channel: voice|music|both`) with per-channel `{type:"volume",
+channel}` broadcasts so every open knob stays in sync (incl. when she changes
+one). Created unconditionally (independent of the agent), default
+`SIENNA_VOLUME` (200%) each, clamp `0…SIENNA_VOLUME_MAX` (400%). When
+Mongo-backed memory exists every change is write-through persisted
+(`volume_voice` / `volume_music` settings keys; the pre-split `volume` key
+seeds a missing channel at boot) and restored before the server listens, so
+the set volumes **survive restarts**; without Mongo they stay in-RAM. The
+knobs are `role=slider` divs, so `disableAllControls` never touches them
+(server-side state, usable while the device is offline).
 Synthesis + device streaming (`POST /api/tts`, fire-and-forget — it returns a JSON
 status, `{ok:true}` or `503 device_offline`/`tts_not_configured`, as soon as the
 stream is kicked off so a long clip doesn't hold the request open) and tag
@@ -431,7 +446,11 @@ and fired device timers all feed the same `agent.run(input, {source})`. Modules
   `SIENNA_LISTEN_SECONDS_MAX`). Overheard speech routes as one interactive
   `agent.run(text, {source:"eavesdrop"})` turn (vocal tools available, and as a
   human source it seeds her reflection sequence); silence still counts as the day's
-  eavesdrop. Gated on **Autonomous speech** and skipped when a conversation is in
+  eavesdrop — and "silence" includes Scribe's non-speech artifacts: a transcript
+  that is empty/whitespace, punctuation-only ("..."), or nothing but bracketed
+  sound-tags ("(door closes)", "[music]") routes NOTHING (she once started a
+  music search off such a phantom commit). The guard requires a letter/digit
+  outside brackets. Gated on **Autonomous speech** and skipped when a conversation is in
   flight (agent busy / PTT held / transcriber active / `listen` running / her voice
   audible) — re-checked after the window so a mid-listen PTT turn isn't
   double-routed. Built only when the agent **and** Scribe are configured.
@@ -503,13 +522,17 @@ live on every jukebox state change — and the composer's **Send button sits on 
 own line under the textarea** (`.sienna-input-row` is a column; a right-edge
 button was easy to miss).
 
-**Two-area layout (`dashboard.html` + `public/js/panels/views.js`).** A header
-view-switcher (segmented `.view-tab` pills, `initViews`) toggles two `<main>`
+**Four-view layout (`dashboard.html` + `public/js/panels/views.js`).** A header
+view-switcher (segmented `.view-tab` pills, `initViews`) toggles four `<main>`
 areas — one visible at a time, the choice persisted in `localStorage`
-(`sienna.view`): **Input / Output** (`#view-io`: Light sensor, Audio, LEDs,
-Camera, Voice — a masonry/multi-column card layout) and **Sienna** (`#view-sienna`:
-the card widget above plus the live **Speech** push-to-talk transcription panel
-as a side rail, so you talk to her and see replies in one place). Panels are
+(`sienna.view`): **Diagnostics** (`#view-io`: Microphone, Light sensor, LEDs,
+Speaker, Voice, **Agent** — the Autonomous-speech toggle, `panels/autonomy.js` —
+and Camera), **Interact** (`#view-sienna`: now-playing bar + composer + the
+Speech monitor with the on-screen Push to talk + the two volume knobs),
+**Usage** (`#view-usage`), and **Logs** (`#view-logs` / `#panel-sienna-logs`:
+the Activity / Messages / Memories / Personality History / Tool Calls / Images
+tab strip + feeds, mounted there by `sienna.js` — hidden views keep their JS
+alive, so live entries keep prepending while Logs isn't showing). Panels are
 position-independent — each `initX*` grabs its `#panel-*` by id then rewrites its
 own `innerHTML`, so the areas are pure HTML re-parenting; only `dashboard.js`'s
 init order is load-bearing (`loopback`/`listen` must run after the panels whose
