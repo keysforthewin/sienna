@@ -202,3 +202,51 @@ test("onDeviceCommand returns an unsubscribe function", () => {
   bridge.sendToDevice({ type: "set_blue_led", on: true });
   assert.equal(seen.length, 0);
 });
+
+test("deviceAudioInFlight = playback bytes sent minus the device's reported consumption", () => {
+  const bridge = new Bridge();
+  bridge.attachDevice(new FakeSession());
+  assert.equal(bridge.deviceAudioInFlight(), null, "unknown until the device reports play_stats");
+  bridge.sendBinaryToDevice(Buffer.alloc(100, 0x03));   // playback frame: counted
+  bridge.sendBinaryToDevice(Buffer.from([0x01, 0, 0])); // any other tag: not counted
+  bridge.notePlayStats({ rx: 40 });
+  assert.equal(bridge.deviceAudioInFlight(), 60);
+  bridge.notePlayStats({ rx: 100 });
+  assert.equal(bridge.deviceAudioInFlight(), 0);
+});
+
+test("deviceAudioInFlight resets per connection and ignores stale reports", () => {
+  const bridge = new Bridge();
+  bridge.attachDevice(new FakeSession());
+  bridge.sendBinaryToDevice(Buffer.alloc(100, 0x03));
+  bridge.notePlayStats({ rx: 10 });
+  const at = bridge.playStats.at;
+  assert.equal(bridge.deviceAudioInFlight(at + 5000), 90, "a 5 s old report still counts");
+  assert.equal(bridge.deviceAudioInFlight(at + 5001), null, "older ⇒ unknown (fallback gate)");
+  bridge.attachDevice(new FakeSession());               // reconnect: fw resets its counter too
+  assert.equal(bridge.deviceAudioInFlight(), null);
+  bridge.notePlayStats({ rx: 0 });
+  assert.equal(bridge.deviceAudioInFlight(), 0, "tx counter restarted from zero");
+});
+
+test("deviceAudioInFlight is null with no device", () => {
+  const bridge = new Bridge();
+  const device = new FakeSession();
+  bridge.attachDevice(device);
+  bridge.notePlayStats({ rx: 0 });
+  device.emit("close");
+  assert.equal(bridge.deviceAudioInFlight(), null);
+});
+
+test("deviceAudioQueued = reported ring (drained at 32 B/ms since the report) + in-flight", () => {
+  const bridge = new Bridge();
+  bridge.attachDevice(new FakeSession());
+  bridge.sendBinaryToDevice(Buffer.alloc(1000, 0x03));
+  bridge.notePlayStats({ rx: 600 });                     // no ring field ⇒ unknown
+  assert.equal(bridge.deviceAudioQueued(), null);
+  bridge.notePlayStats({ rx: 600, ring: 5000 });
+  const at = bridge.playStats.at;
+  assert.equal(bridge.deviceAudioQueued(at), 5400);
+  assert.equal(bridge.deviceAudioQueued(at + 100), 5000 - 3200 + 400, "ring drains while no report arrives");
+  assert.equal(bridge.deviceAudioQueued(at + 1000), 400, "ring floor 0, in-flight still counts");
+});

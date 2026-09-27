@@ -171,3 +171,11 @@ test("buildServerCommand accepts set_blue_flash", () => {
   const json = buildServerCommand({ type: "set_blue_flash", on: true }, "r1");
   assert.deepEqual(JSON.parse(json), { type: "set_blue_flash", ref: "r1", on: true });
 });
+
+test("parses device play_stats flow-control telemetry", () => {
+  const m = parseDeviceMessage('{"type":"play_stats","rx":123456,"ring":81920,"drop":2,"under":7,"ts_ms":9}');
+  assert.equal(m.rx, 123456);
+  assert.equal(m.ring, 81920);
+  assert.equal(parseDeviceMessage('{"type":"play_stats","rx":0,"ts_ms":1}').rx, 0, "diagnostics optional");
+  assert.throws(() => parseDeviceMessage('{"type":"play_stats","ts_ms":1}'), "rx required");
+});

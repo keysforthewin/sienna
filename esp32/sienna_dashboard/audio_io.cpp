@@ -273,6 +273,12 @@ bool isSpeakerActive() {
   return gPlaybackActive || (gPlayStream && !xStreamBufferIsEmpty(gPlayStream));
 }
 
+PlaybackStats playbackStats() {
+  PlaybackStats st{0, gPlayDropped.load(), gPlayUnderrun.load()};
+  if (gPlayStream) st.ringBytes = (uint32_t)xStreamBufferBytesAvailable(gPlayStream);
+  return st;
+}
+
 void setMuteProbe(std::function<bool()> probe) { gMuteProbe = std::move(probe); }
 
 void playPcmStreamFeed(const int16_t* samples, size_t count) {

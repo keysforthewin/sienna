@@ -76,7 +76,7 @@ export function attachDeviceWs(wss, bridge, recorder, transcriber, token, debug 
     // streams (mic_rms ~20 Hz, ldr ~5 Hz, recorded PCM) are rate-limited so
     // the console stays readable; everything else logs as it arrives.
     const lastLog = new Map();
-    const THROTTLE_MS = { mic_rms: 1000, ldr: 1000, recorded_pcm: 1000 };
+    const THROTTLE_MS = { mic_rms: 1000, ldr: 1000, recorded_pcm: 1000, play_stats: 1000 };
     const logRx = (key, line) => {
       if (!debug) return;
       const gap = THROTTLE_MS[key] || 0;
@@ -155,6 +155,14 @@ export function attachDeviceWs(wss, bridge, recorder, transcriber, token, debug 
         ws.close(4001, "hello_after_attach");
         return;
       }
+      if (msg.type === "play_stats") {
+        // Playback flow-control telemetry (~4/s while audio flows): feeds the
+        // bridge's in-flight gate. Internal only — not forwarded to browsers or
+        // device-rpc taps (it would flood the dashboard socket for no reader).
+        bridge.notePlayStats(msg);
+        logRx("play_stats", `play_stats rx=${msg.rx} ring=${msg.ring} drop=${msg.drop} under=${msg.under}`);
+        return;
+      }
       if (msg.type === "net_stats") {
         // Always logged (not debug-gated): this is the disconnect-diagnosis
         // trail — Wi-Fi RSSI + heap from the device, WS ping RTT from our
@@ -177,6 +185,9 @@ export function attachDeviceWs(wss, bridge, recorder, transcriber, token, debug 
           }
           lastBytes = { r: sock.bytesRead, w: sock.bytesWritten, at: nowMs };
         }
+        const inFlight = typeof bridge.deviceAudioInFlight === "function" ? bridge.deviceAudioInFlight() : null;
+        const ps = bridge.playStats;
+        if (inFlight != null && ps) rate += ` inflight=${Math.round(inFlight / 1024)}K ring=${Math.round((ps.ring ?? 0) / 1024)}K drop=${ps.drop ?? "?"} under=${ps.under ?? "?"}`;
         console.log(`[device-ws] net rssi=${msg.rssi}dBm rtt=${lastRttMs != null ? lastRttMs + "ms" : "?"}${rate} missedPongs=${pongsMissed} heap=${heapK} minHeap=${minHeapK} wifiDrops=${drops}${reason}`);
         lastNet = { rssi: msg.rssi, rtt: lastRttMs, buf: ws.bufferedAmount, missedPongs: pongsMissed, at: Date.now() };
       }

@@ -74,6 +74,21 @@ export const NetStatsMsg = z.object({
   ts_ms: z.number().int(),
 });
 
+// Playback flow control (~4/s while playback audio flows): `rx` = cumulative
+// PLAYBACK_PCM bytes (full binary frames, tag included) the device's receive path
+// has consumed since this WS connection opened — the server subtracts it from what
+// it sent to get the true in-flight downlink backlog (bridge.deviceAudioInFlight).
+// ring/drop/under are the playback ring fill (bytes) and its overflow/underrun
+// counters since boot (diagnostics).
+export const PlayStatsMsg = z.object({
+  type: z.literal("play_stats"),
+  rx: z.number().int().nonnegative(),
+  ring: z.number().int().nonnegative().optional(),
+  drop: z.number().int().nonnegative().optional(),
+  under: z.number().int().nonnegative().optional(),
+  ts_ms: z.number().int(),
+});
+
 // ---- Sienna agent device-RPC responses (new firmware) ----
 // Each carries the request's `ref` so the server can correlate exactly; older
 // firmware that omits it falls back to next-message-of-type matching.
@@ -114,7 +129,7 @@ export const TimerFiredMsg = z.object({
 
 export const DeviceMsg = z.discriminatedUnion("type", [
   HelloMsg, StateMsg, MicRmsMsg, LdrMsg, AckMsg, EventMsg,
-  ButtonMsg, NetStatsMsg,
+  ButtonMsg, NetStatsMsg, PlayStatsMsg,
   WifiScanMsg, BleScanMsg, TimerSetMsg, TimerFiredMsg,
 ]);
 

@@ -5,6 +5,10 @@ WORKDIR /app
 
 # Media tools for the agent's play_audio_file / play_youtube speaker tools.
 # ffmpeg decodes/resamples to 16 kHz mono; yt-dlp pulls YouTube audio.
+# NOTE: this layer is cached across rebuilds, so yt-dlp goes stale — YouTube
+# then rejects every download with "HTTP Error 403: Forbidden" (search still
+# works, tracks end with reason=error frames=0). Fix: rebuild without cache
+# (`docker compose build --no-cache server`) to pull the current Alpine package.
 RUN apk add --no-cache ffmpeg yt-dlp
 
 # Install production deps first for better layer caching.

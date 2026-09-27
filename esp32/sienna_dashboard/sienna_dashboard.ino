@@ -165,11 +165,20 @@ static void handleCommand(const String& json) {
 }
 
 // ---- Binary frame from server (playback PCM) ----
+// Playback bytes consumed this WS connection (reset in enterOnline), reported to
+// the server as play_stats. Counted AFTER the feed returns — the feed parks while
+// the ring is full, so this advances at the rate the device actually drains the
+// socket, and sent − consumed is the true downlink backlog the server throttles on.
+// Every playback frame counts, including ones the feed dropped (inactive / muted /
+// ring-full timeout): they're off the wire either way.
+static uint32_t gRxPlaybackBytes = 0;
+
 static void handleBinary(const uint8_t* buf, size_t len) {
   if (len < 1) return;
   uint8_t tag = buf[0];
   if (tag == protocol::TAG_PLAYBACK_PCM) {
     audio_io::playPcmStreamFeed((const int16_t*)(buf + 1), (len - 1) / sizeof(int16_t));
+    gRxPlaybackBytes += len;
   }
 }
 
@@ -210,6 +219,7 @@ static void enterWsOpening() {
 }
 
 static void enterOnline() {
+  gRxPlaybackBytes = 0;   // the server's sent-bytes counter restarts per connection too
   state::set(state::S::ONLINE);
   applyStatusColor();
   // BLE is intentionally down while online — its internal RAM is needed for the
@@ -400,6 +410,23 @@ void loop() {
           ws_client::sendText(protocol::buildNetStats(
               r, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
               reason, wifi_manager::disconnectCount(), millis()));
+      }
+    }
+  }
+
+  // Playback flow control: report consumed playback bytes every 250 ms while they're
+  // advancing (one final report after audio stops, then silence). The server gates
+  // its sends on sent − rx so the downlink never backs up past ~1 s.
+  {
+    static uint32_t lastPlayStatsMs = 0;
+    static uint32_t lastReportedRx = 0;
+    if ((uint32_t)(millis() - lastPlayStatsMs) >= 250) {
+      lastPlayStatsMs = millis();
+      if (state::current() == state::S::ONLINE && gRxPlaybackBytes != lastReportedRx) {
+        lastReportedRx = gRxPlaybackBytes;
+        audio_io::PlaybackStats ps = audio_io::playbackStats();
+        ws_client::sendText(protocol::buildPlayStats(
+            gRxPlaybackBytes, ps.ringBytes, ps.dropped, ps.underruns, millis()));
       }
     }
   }

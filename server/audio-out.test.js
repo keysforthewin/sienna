@@ -142,6 +142,54 @@ test("paced loop waits on device backpressure (bufferedAmount) before sending", 
   assert.ok(sleeps >= 8, `expected the loop to wait for drain, saw ${sleeps} sleeps`);
 });
 
+test("paced loop waits while device-acknowledged in-flight bytes exceed ~1 s", async () => {
+  // chunkSamples 2 ⇒ frameBytes 4 ⇒ INFLIGHT_HIGH = 32, LOW = 16. bufferedAmount stays
+  // ~0 (the kernel swallowed the backlog) — only the device's play_stats reveals it.
+  let inFlight = 40;
+  let sleeps = 0;
+  const bridge = {
+    ...makeBridge(),
+    deviceBufferedAmount() { return 0; },
+    deviceAudioInFlight() { return inFlight; },
+  };
+  const sleep = () => { sleeps += 1; inFlight = Math.max(0, inFlight - 4); return Promise.resolve(); };
+  const audio = createAudioOut({ bridge, tts: {}, sleep, refGen, chunkSamples: 2 });
+
+  const frames = await audio.streamPcm(Int16Array.from([1, 2]));
+
+  assert.equal(frames, 1);
+  assert.equal(bridge.bins.length, 1);
+  // 40 → ≤ 16 takes 6 device-drain polls before the frame goes out.
+  assert.equal(sleeps, 6);
+});
+
+test("paced loop never overfills the device ring (ring + in-flight gate)", async () => {
+  // Regression: dropped frames count as consumed, so with in-flight low the server
+  // kept over-delivering into a full ring and the firmware dropped ~2 frames/s.
+  // chunkSamples 2 ⇒ frameBytes 4; deviceRingBytes 40 ⇒ QUEUED_HIGH 32, LOW 24.
+  let queued = 36;
+  let sleeps = 0;
+  const bridge = {
+    ...makeBridge(),
+    deviceBufferedAmount() { return 0; },
+    deviceAudioInFlight() { return 0; },
+    deviceAudioQueued() { return queued; },
+  };
+  const sleep = () => { sleeps += 1; queued = Math.max(0, queued - 4); return Promise.resolve(); };
+  const audio = createAudioOut({ bridge, tts: {}, sleep, refGen, chunkSamples: 2, deviceRingBytes: 40 });
+
+  assert.equal(await audio.streamPcm(Int16Array.from([1, 2])), 1);
+  assert.equal(bridge.bins.length, 1);
+  assert.equal(sleeps, 3, "36 → ≤ 24 before sending");
+});
+
+test("unknown in-flight (null: old firmware / stale report) does not gate", async () => {
+  const bridge = { ...makeBridge(), deviceBufferedAmount() { return 0; }, deviceAudioInFlight() { return null; } };
+  const audio = createAudioOut({ bridge, tts: {}, sleep: noSleep, refGen, chunkSamples: 2 });
+  assert.equal(await audio.streamPcm(Int16Array.from([1, 2, 3, 4])), 2);
+  assert.equal(bridge.bins.length, 2);
+});
+
 test("no backpressure gating when bridge lacks deviceBufferedAmount", async () => {
   const bridge = makeBridge();        // no deviceBufferedAmount accessor
   const audio = createAudioOut({ bridge, tts: {}, sleep: noSleep, refGen, chunkSamples: 2 });

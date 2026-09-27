@@ -76,6 +76,18 @@ String buildNetStats(int rssi, uint32_t freeHeap, uint32_t minFreeHeap,
   String s; serializeJson(doc, s); return s;
 }
 
+String buildPlayStats(uint32_t rxBytes, uint32_t ringBytes, uint32_t dropped,
+                      uint32_t underruns, uint32_t tsMs) {
+  JsonDocument doc;
+  doc["type"] = "play_stats";
+  doc["rx"] = rxBytes;
+  doc["ring"] = ringBytes;
+  doc["drop"] = dropped;
+  doc["under"] = underruns;
+  doc["ts_ms"] = tsMs;
+  String s; serializeJson(doc, s); return s;
+}
+
 // networksJson/devicesJson are already-serialized JSON arrays; embed verbatim.
 String buildWifiScan(const char* ref, const String& networksJson) {
   String s = "{\"type\":\"wifi_scan\",\"ref\":\"";

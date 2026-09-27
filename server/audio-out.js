@@ -63,6 +63,7 @@ export function createAudioOut({
                         // never passes through ffmpeg, so it's untouched); "" ⇒ omit
   spawn = childSpawn,
   refGen = randomUUID,
+  deviceRingBytes = 81920, // firmware PLAY_RING_BYTES (audio_io.cpp) — the flow-control ceiling
   chunkSamples = 2048,   // samples/frame — big enough that ~15 frames/s ≥ realtime (see header)
   pacingMs = 80,         // generic poll interval for the backpressure / lead-in waits (NOT
                          // the voice delivery rate — that's ttsPacingMs below). Kept distinct
@@ -387,21 +388,59 @@ export function createAudioOut({
     typeof bridge.deviceBufferedAmount === "function" ? bridge.deviceBufferedAmount() : 0;
   const BACKPRESSURE_HIGH = frameBytes * 8;  // ~8 frames (~512 ms) queued ⇒ pause
   const BACKPRESSURE_LOW = frameBytes * 2;   // …resume once it drains to ~2 frames
+  // Device-acknowledged backpressure. bufferedAmount above only sees Node's own
+  // queue; the kernel send buffer (and the Windows portproxy hop the device
+  // connects through) swallow everything, so it sat at ~1 frame while seconds of
+  // audio backed up toward a device whose ring was full — every server→device
+  // frame, incl. the pong to the firmware's heartbeat ping, queued behind it, and
+  // at >3 s the firmware dropped the link (1006, every ~22 s during music). The
+  // firmware now reports the playback bytes it has consumed (play_stats); in-flight
+  // = sent − consumed is the real downlink backlog. Cap it at ~1 s of audio so the
+  // link latency stays far under the heartbeat's 3 s pong timeout. null ⇒ unknown
+  // (older firmware / no recent report) ⇒ only the bufferedAmount gate applies.
+  const deviceInFlight = () =>
+    typeof bridge.deviceAudioInFlight === "function" ? bridge.deviceAudioInFlight() : null;
+  const INFLIGHT_HIGH = frameBytes * 8;      // ~1 s (2048-sample frames) in flight ⇒ pause
+  const INFLIGHT_LOW = frameBytes * 4;       // …resume once it drains to ~0.5 s
+  // Never overfill the device ring. Delivery runs faster than realtime (music/voice
+  // pacing < 128 ms) to keep the ring topped up, which used to lean on the firmware
+  // parking loop() until the ring had room. But that wait DROPS the frame after
+  // 200 ms, and drops immediately while recording (PTT over the music bed, a
+  // dashboard Listen, eavesdrop) — and a dropped frame counts as "consumed", so the
+  // in-flight gate stayed open and the server kept over-delivering into a full ring:
+  // a steady ~2 dropped frames/s (audible skipping). Gating on ring + in-flight below
+  // capacity means the device never has to wait or drop at all.
+  const deviceQueued = () =>
+    typeof bridge.deviceAudioQueued === "function" ? bridge.deviceAudioQueued() : null;
+  const QUEUED_HIGH = Math.max(frameBytes, deviceRingBytes - frameBytes * 2);  // headroom for 2 frames
+  const QUEUED_LOW = Math.max(0, QUEUED_HIGH - frameBytes * 2);
+  const backedUp = (bufLimit, flightLimit, queuedLimit) => {
+    if (deviceBuffered() > bufLimit) return true;
+    const f = deviceInFlight();
+    if (f != null && f > flightLimit) return true;
+    const q = deviceQueued();
+    return q != null && q > queuedLimit;
+  };
   // `stats` (optional, music drain only) accumulates the diagnostic counters: the
-  // peak socket backlog seen, and how often / how long we paused for the device to
-  // drain — the direct "the device's Wi-Fi link can't keep up" signal. Voice passes
-  // none (its summary isn't logged).
+  // peak socket backlog / in-flight bytes seen, and how often / how long we paused
+  // for the device to drain — the direct "the device can't keep up" signal. Voice
+  // passes none (its summary isn't logged).
+  const notePeaks = (stats) => {
+    if (!stats) return;
+    const b = deviceBuffered();
+    if (b > stats.deviceBufPeak) stats.deviceBufPeak = b;
+    const f = deviceInFlight();
+    if (f != null && f > stats.inFlightPeak) stats.inFlightPeak = f;
+  };
   async function awaitDeviceDrain(ch, stats = null) {
     if (!canTransmit(ch)) return;   // dropped frames see no backpressure
-    const cur = deviceBuffered();
-    if (stats && cur > stats.deviceBufPeak) stats.deviceBufPeak = cur;
-    if (cur < BACKPRESSURE_HIGH) return;
+    notePeaks(stats);
+    if (!backedUp(BACKPRESSURE_HIGH - 1, INFLIGHT_HIGH - 1, QUEUED_HIGH - 1)) return;
     if (stats) stats.pauses += 1;
     const pauseStart = clock();
-    while (!ch.abort && deviceBuffered() > BACKPRESSURE_LOW) {
+    while (!ch.abort && canTransmit(ch) && backedUp(BACKPRESSURE_LOW, INFLIGHT_LOW, QUEUED_LOW)) {
       await sleep(pacingMs);
-      const b = deviceBuffered();
-      if (stats && b > stats.deviceBufPeak) stats.deviceBufPeak = b;
+      notePeaks(stats);
     }
     if (stats) stats.pausedMs += clock() - pauseStart;
   }
@@ -461,7 +500,7 @@ export function createAudioOut({
     // saturation); queueMin/underruns track the in-memory PCM queue (source
     // starvation); maxGapMs is the longest silence between transmitted frames
     // (the audible-stutter magnitude, whichever buffer caused it).
-    const stats = { deviceBufPeak: 0, pauses: 0, pausedMs: 0, queueMin: Infinity, underruns: 0, maxGapMs: 0 };
+    const stats = { deviceBufPeak: 0, inFlightPeak: 0, pauses: 0, pausedMs: 0, queueMin: Infinity, underruns: 0, maxGapMs: 0 };
     let lastFrameAt = null;     // clock() of the previous TRANSMITTED frame
     let lastStatAt = t0;        // clock() of the previous live-sampler line
 
@@ -548,7 +587,8 @@ export function createAudioOut({
           }
           if (audioStatsMs > 0 && clock() - lastStatAt >= audioStatsMs) {
             lastStatAt = clock();
-            log(`audio-stats ${ch.name} t=${clock() - t0}ms: deviceBuf=${deviceBuffered()}/${stats.deviceBufPeak} queue=${queuedBytes} pauses=${stats.pauses} underruns=${stats.underruns} maxGap=${stats.maxGapMs}ms`);
+            const f = deviceInFlight();
+            log(`audio-stats ${ch.name} t=${clock() - t0}ms: deviceBuf=${deviceBuffered()}/${stats.deviceBufPeak} inflight=${f == null ? "?" : f}/${stats.inFlightPeak} queue=${queuedBytes} pauses=${stats.pauses} underruns=${stats.underruns} maxGap=${stats.maxGapMs}ms`);
           }
           off += frameBytes; frames += 1;
           if (frames >= maxFrames) { ch.abort = true; break; }
@@ -562,7 +602,7 @@ export function createAudioOut({
       signalRoom(); wake(); await producer; clearSignals();
     }
     log(`${label}: drain done frames=${frames} in ${clock() - t0}ms`
-      + ` | deviceBuf peak=${stats.deviceBufPeak} (HIGH=${BACKPRESSURE_HIGH}) pauses=${stats.pauses} pausedMs=${stats.pausedMs}`
+      + ` | deviceBuf peak=${stats.deviceBufPeak} (HIGH=${BACKPRESSURE_HIGH}) inflight peak=${stats.inFlightPeak} (HIGH=${INFLIGHT_HIGH}) pauses=${stats.pauses} pausedMs=${stats.pausedMs}`
       + ` | queue min=${stats.queueMin === Infinity ? 0 : stats.queueMin}/${maxBufferBytes} underruns=${stats.underruns}`
       + ` | maxGap=${stats.maxGapMs}ms`);
     return frames;

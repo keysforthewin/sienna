@@ -43,6 +43,11 @@ void setMuteProbe(std::function<bool()> probe);
 // Used by the half-duplex mic gate: suppress recorded-PCM sends while the speaker plays.
 bool isSpeakerActive();
 
+// Playback ring diagnostics for the server's play_stats flow control: current ring
+// fill (bytes) plus the since-boot overflow-drop / underrun counters.
+struct PlaybackStats { uint32_t ringBytes; uint32_t dropped; uint32_t underruns; };
+PlaybackStats playbackStats();
+
 void tick();  // call from loop() — drives mic read + RMS
 
 }  // namespace audio_io

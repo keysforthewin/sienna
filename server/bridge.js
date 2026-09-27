@@ -1,3 +1,14 @@
+import { BinTag } from "./protocol.js";
+
+const PLAYBACK_PCM_TAG = BinTag.PLAYBACK_PCM;
+// A play_stats report older than this is ignored (the device sends ~4/s while
+// audio flows). Longer than any sane gating pause, so a device that stalls briefly
+// keeps the server paused; one that stops reporting altogether (bug, old fw after
+// a mid-session reflash) degrades to the legacy bufferedAmount gate, not a hang.
+const PLAY_STATS_STALE_MS = 5000;
+// Device playback drain rate: 16 kHz mono int16.
+const PLAYBACK_BYTES_PER_MS = 32;
+
 export class Bridge {
   constructor() {
     this.device = null;
@@ -22,6 +33,11 @@ export class Bridge {
     // …and every JSON command sent TO the device (sendToDevice). Used by
     // light-state to mirror the last commanded LED state.
     this.deviceCommandCbs = new Set();
+    // Device-acknowledged playback flow control (see deviceAudioInFlight). Both
+    // counters are per device connection: the firmware resets its consumed-bytes
+    // counter on every connect, and attachDevice() resets ours.
+    this.playbackTxBytes = 0;     // PLAYBACK_PCM bytes (full frames, incl. tag) sent this connection
+    this.playStats = null;        // last {rx, ring, drop, under, at} the device reported
   }
 
   onDeviceDisconnected(cb) {
@@ -73,6 +89,8 @@ export class Bridge {
     }
     this.device = session;
     this.lastDeviceState = null;  // new session — any prior state is stale
+    this.playbackTxBytes = 0;
+    this.playStats = null;
     this.broadcastToBrowsers({ type: "device_connected" });
     for (const cb of this.deviceConnectCbs) {
       try { cb(); } catch { /* one bad listener shouldn't break the rest */ }
@@ -124,7 +142,42 @@ export class Bridge {
   sendBinaryToDevice(buf) {
     if (!this.device) return false;
     this.device.send(buf);
+    if (buf.length && buf[0] === PLAYBACK_PCM_TAG) this.playbackTxBytes += buf.length;
     return true;
+  }
+
+  // The device's periodic play_stats report: cumulative PLAYBACK_PCM bytes its
+  // receive path has consumed this connection (`rx`) plus ring diagnostics.
+  notePlayStats({ rx, ring, drop, under }) {
+    if (!Number.isFinite(rx)) return;
+    this.playStats = { rx, ring, drop, under, at: Date.now() };
+  }
+
+  // Playback bytes sent but not yet consumed by the device — i.e. sitting in the
+  // TCP send/receive buffers and the Windows portproxy hop, where bufferedAmount
+  // can't see them. The device only reads the socket when its playback ring has
+  // room, so this is the true downlink backlog; every server→device frame (incl.
+  // WS pongs) queues behind it. Returns null when unknown: no device, firmware
+  // that doesn't report play_stats, or a report older than PLAY_STATS_STALE_MS
+  // (callers then fall back to bufferedAmount-only gating).
+  deviceAudioInFlight(now = Date.now()) {
+    if (!this.device || !this.playStats) return null;
+    if (now - this.playStats.at > PLAY_STATS_STALE_MS) return null;
+    return Math.max(0, this.playbackTxBytes - this.playStats.rx);
+  }
+
+  // Audio queued ahead of the device's speaker: the last reported ring fill, drained
+  // at the realtime play rate since that report, plus everything sent but not yet
+  // consumed (in-flight — frames consumed since the report are in the ring). The
+  // drain term matters: the firmware only reports while `rx` advances, so when the
+  // server pauses on a full ring no fresh report arrives, and the stale fill would
+  // hold the gate shut until the ring ran dry. null when unknown (same rules as
+  // deviceAudioInFlight, or a report without `ring`).
+  deviceAudioQueued(now = Date.now()) {
+    const inFlight = this.deviceAudioInFlight(now);
+    if (inFlight == null || !Number.isFinite(this.playStats.ring)) return null;
+    const drained = (now - this.playStats.at) * PLAYBACK_BYTES_PER_MS;
+    return Math.max(0, this.playStats.ring - drained) + inFlight;
   }
 
   // Bytes queued in the device socket's send buffer but not yet flushed to the

@@ -22,6 +22,13 @@ String buildButton(const char* id, bool pressed, uint32_t tsMs);
 // min-ever free heap, last Wi-Fi disconnect reason code + drop count since boot.
 String buildNetStats(int rssi, uint32_t freeHeap, uint32_t minFreeHeap,
                      int discReason, uint32_t discCount, uint32_t tsMs);
+// Playback flow control (~4/s while playback audio flows): rxBytes = cumulative
+// TAG_PLAYBACK_PCM bytes (whole frames, tag included) consumed by the receive path
+// since this WS connection opened. The server subtracts it from what it sent to
+// cap the in-flight downlink backlog (else pongs queue behind seconds of audio and
+// the heartbeat drops the link). ring/drop/under are playback-ring diagnostics.
+String buildPlayStats(uint32_t rxBytes, uint32_t ringBytes, uint32_t dropped,
+                      uint32_t underruns, uint32_t tsMs);
 // Sienna agent device-RPC responses. networksJson / devicesJson are pre-built
 // JSON array strings, embedded verbatim into the message.
 String buildWifiScan(const char* ref, const String& networksJson);

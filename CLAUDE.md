@@ -362,6 +362,14 @@ and fired device timers all feed the same `agent.run(input, {source})`. Modules
   raw-GPIO instant mute discards while the button is down). Device arming is
   lazy per-channel (`play_audio_start` on the first transmitted frame; the
   winner of a focus handoff flushes the loser's tail with `stop_audio`).
+  **Downlink flow control:** `ws.bufferedAmount` can't see a backlog (the kernel
+  send buffer + the Windows portproxy hop swallow it), so the firmware reports the
+  playback bytes it has consumed (`play_stats` `{rx, ring, drop, under}`, ~4/s while
+  audio flows, counter reset per connection) and `bridge.deviceAudioInFlight()` =
+  sent − rx; `awaitDeviceDrain` pauses while it exceeds ~1 s of audio. Without it,
+  seconds of audio queued ahead of the firmware heartbeat's pong (3 s timeout × 2)
+  and the device dropped the link (1006) every ~22 s during music. Old firmware /
+  a report older than 5 s ⇒ null ⇒ legacy bufferedAmount gate only.
   `isPlaying()`/`isPlayingOrTail()` are her-voice predicates and false while
   muted (the PTT mic gate depends on it). Her reply no longer supersedes a
   jukebox track — the jukebox's superseded/replay path only fires for

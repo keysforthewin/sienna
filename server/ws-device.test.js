@@ -131,6 +131,24 @@ test("device net_stats telemetry is broadcast to browsers", async () => {
   });
 });
 
+test("device play_stats feeds the bridge's in-flight gate and is not broadcast", async () => {
+  await withServer(async ({ port, bridge }) => {
+    const browserSpy = { sent: [], send(p) { this.sent.push(p); }, on() {}, close() {} };
+    bridge.attachBrowser(browserSpy);
+    const ws = connect(port);
+    await waitOpen(ws);
+    ws.send(JSON.stringify({ type: "hello", token: TOKEN }));
+    await new Promise((r) => setTimeout(r, 30));
+    bridge.sendBinaryToDevice(Buffer.alloc(4097, 0x03));
+    ws.send(JSON.stringify({ type: "play_stats", rx: 1000, ring: 8192, drop: 0, under: 3, ts_ms: 1 }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(bridge.deviceAudioInFlight(), 3097);
+    assert.equal(bridge.playStats.under, 3);
+    assert.ok(!browserSpy.sent.some(p => typeof p === "string" && p.includes("play_stats")));
+    ws.close();
+  });
+});
+
 test("recorded PCM (binary tag 0x01) appends to recorder while recording", async () => {
   await withServer(async ({ port, bridge, recorder }) => {
     const ws = connect(port);
