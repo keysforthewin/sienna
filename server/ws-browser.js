@@ -48,6 +48,14 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
       } catch {}
     }
 
+    // And the crossfade dial (seconds between jukebox tracks) + its bounds.
+    if (audioOut?.getCrossfadeSecs) {
+      try {
+        const b = audioOut.crossfadeBounds();
+        ws.send(JSON.stringify({ type: "crossfade", secs: audioOut.getCrossfadeSecs(), min: b.min, max: b.max, step: b.step }));
+      } catch {}
+    }
+
     // And the current now-playing state, so a freshly-opened dashboard shows the
     // track that's already on (live changes arrive via the jukebox's broadcast).
     if (getNowPlaying) {
@@ -185,6 +193,13 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
       // Voice (TTS) pacing: same as music. onTtsPacingChange broadcasts {type:"tts_pacing"}.
       if (msg.type === "set_tts_pacing") {
         if (audioOut?.setTtsPacingMs) audioOut.setTtsPacingMs(msg.ms);
+        ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
+        return;
+      }
+      // Crossfade dial: seconds of crossfade between jukebox tracks. onCrossfadeChange
+      // broadcasts {type:"crossfade"} to keep every dial in sync.
+      if (msg.type === "set_crossfade") {
+        if (audioOut?.setCrossfadeSecs) audioOut.setCrossfadeSecs(msg.secs);
         ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
         return;
       }

@@ -179,3 +179,12 @@ test("parses device play_stats flow-control telemetry", () => {
   assert.equal(parseDeviceMessage('{"type":"play_stats","rx":0,"ts_ms":1}').rx, 0, "diagnostics optional");
   assert.throws(() => parseDeviceMessage('{"type":"play_stats","ts_ms":1}'), "rx required");
 });
+
+
+test("set_crossfade parses as a browser command with fractional seconds, bounded 0–8", () => {
+  const ok = parseBrowserMessage(JSON.stringify({ type: "set_crossfade", ref: "r1", secs: 2.5 }));
+  assert.equal(ok.type, "set_crossfade");
+  assert.equal(ok.secs, 2.5);
+  assert.throws(() => parseBrowserMessage(JSON.stringify({ type: "set_crossfade", ref: "r1", secs: 9 })));
+  assert.throws(() => parseBrowserMessage(JSON.stringify({ type: "set_crossfade", ref: "r1", secs: -1 })));
+});

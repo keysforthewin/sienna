@@ -410,6 +410,9 @@ input[type=range] { accent-color: var(--accent); flex: 1; min-width: 0; }
   text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
 }
 .knob-value { color: var(--text); font-size: var(--fs-200); font-variant-numeric: tabular-nums; }
+/* Compact variant (Voice panel's Crossfade dial next to the pacing sliders). */
+.knob.knob-sm { width: 64px; height: 64px; }
+.pacing-knob-row { display: flex; align-items: center; gap: var(--space-4); margin-top: 10px; }
 
 /* On-screen Push to talk: lights up accent while held (mirrors the ptt dot). */
 .speech-ptt.holding {

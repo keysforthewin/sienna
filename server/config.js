@@ -266,9 +266,13 @@ const envSchema = z.object({
   // PREBUFFER_TIMEOUT_MS anyway. MAX_BUFFER_MS bounds memory and propagates
   // backpressure down through ffmpeg → yt-dlp. (Her voice paths never stall and are
   // unaffected.) 0 prebuffer ⇒ start immediately (old behavior).
+  // MAX_BUFFER_MS is ALSO the jukebox's prefetch lead: the producer reaches a track's
+  // EOF while this much audio is still queued, and that EOF triggers the NEXT track's
+  // yt-dlp|ffmpeg prefetch — so it must cover yt-dlp's ~3-4 s resolve plus the longest
+  // crossfade (8 s). ~640 KB of PCM at 20 s.
   SIENNA_PLAYBACK_PREBUFFER_MS: z.coerce.number().int().nonnegative().default(2000),
   SIENNA_PLAYBACK_PREBUFFER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
-  SIENNA_PLAYBACK_MAX_BUFFER_MS: z.coerce.number().int().positive().default(8000),
+  SIENNA_PLAYBACK_MAX_BUFFER_MS: z.coerce.number().int().positive().default(20000),
   // Music streaming-health diagnostics. The per-track summary line (deviceBuf peak,
   // backpressure pauses, queue underruns, max inter-frame gap) is ALWAYS logged. Set
   // this to a millisecond interval (e.g. 2000) to ALSO emit a live "audio-stats"
@@ -287,6 +291,18 @@ const envSchema = z.object({
   // hear underrun gaps (and accept slow overflow on long tracks); raising past 128 will
   // under-deliver and eventually drain the ring.
   SIENNA_MUSIC_PACING_MS: z.coerce.number().int().positive().default(128),
+  // Burst fill: while the device reports fewer than BURST_BELOW_MS of audio queued ahead
+  // of its speaker (a track starts into an EMPTY ring; a Wi-Fi hiccup drains it), the
+  // music drain paces at BURST_PACING_MS instead of MUSIC_PACING_MS so the ~2.5 s
+  // on-device margin is rebuilt in ~2 s instead of ~20 s. The firmware's ring-fill gate
+  // stops the burst overfilling. 0 disables. (Needs firmware that reports play_stats.)
+  SIENNA_MUSIC_BURST_BELOW_MS: z.coerce.number().int().nonnegative().default(1000),
+  SIENNA_MUSIC_BURST_PACING_MS: z.coerce.number().int().positive().default(80),
+  // Crossfade between consecutive jukebox tracks, in seconds (0 = hard cut). The next
+  // track is prefetched while the current one plays; when > 0 the last N seconds of one
+  // are mixed (equal-power) into the first N of the next server-side. Live-tunable via
+  // the dashboard Crossfade dial (0–8 s, 0.5 s steps) and persisted across restarts.
+  SIENNA_MUSIC_CROSSFADE_SECS: z.coerce.number().min(0).max(8).default(0),
   // Per-frame pacing for HER VOICE (ms between 2048-sample frames). This is the DELIVERY
   // rate into the device ring, NOT speech speed — the device plays at 16 kHz regardless,
   // so it never changes how fast she talks. 80 ms ≈ 1.6× realtime banks her short reply

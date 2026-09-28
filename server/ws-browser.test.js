@@ -593,3 +593,49 @@ test("connect-time now_playing frame reflects the live jukebox state", async () 
     ws.close();
   }, { getNowPlaying: () => np });
 });
+
+
+test("set_crossfade updates the live crossfade via audioOut, acks, and is not forwarded to the device", async () => {
+  let secs = 0;
+  const audioOut = {
+    setCrossfadeSecs: (s) => { secs = s; return s; },
+    getCrossfadeSecs: () => secs,
+    crossfadeBounds: () => ({ min: 0, max: 8, step: 0.5 }),
+  };
+  await withServer(async ({ port, bridge }) => {
+    const deviceSpy = { sent: [], send(p) { this.sent.push(p); }, on() {}, close() {} };
+    bridge.attachDevice(deviceSpy);
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    ws.send(JSON.stringify({ type: "set_crossfade", ref: "x1", secs: 2.5 }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(secs, 2.5);
+    assert.ok(messages.some((m) => m && m.type === "ack" && m.ref === "x1"));
+    assert.ok(!deviceSpy.sent.some((p) => /crossfade/.test(p)), "never forwarded to the device");
+    ws.close();
+  }, { audioOut });
+});
+
+test("a connecting browser is told the current crossfade + bounds", async () => {
+  const audioOut = {
+    setCrossfadeSecs: (s) => s,
+    getCrossfadeSecs: () => 3,
+    crossfadeBounds: () => ({ min: 0, max: 8, step: 0.5 }),
+  };
+  await withServer(async ({ port }) => {
+    const ws = connect(port, TOKEN);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    await waitOpen(ws);
+    await new Promise((r) => setTimeout(r, 30));
+    const m = messages.find((x) => x && x.type === "crossfade");
+    assert.ok(m, "expected a crossfade snapshot on connect");
+    assert.equal(m.secs, 3);
+    assert.equal(m.min, 0);
+    assert.equal(m.max, 8);
+    assert.equal(m.step, 0.5);
+    ws.close();
+  }, { audioOut });
+});

@@ -13,11 +13,15 @@
 // flooding the device with many small frames is the failure mode the frame-rate cap
 // guards against). pacingMs sends VOICE ~1.6× realtime so the ring fills fast (her reply
 // is short — it banks on-device and a network blip still completes from the buffer); MUSIC
-// uses musicPacingMs (exact realtime) instead, because over-delivering a long track pins the
-// device ring full and overflows it (dropped frames / choppy) — the device's backpressure
-// gates on its SOCKET, not its playback ring, so the server must pace music to the DAC rate.
-// The device's deep playback ring (~2.56 s) absorbs Wi-Fi jitter in both directions, so
-// realtime music pacing rides out a slow delivery burst without underrunning.
+// uses musicPacingMs (≈ realtime) as its STEADY-STATE rate. The firmware reports what it
+// has consumed and how full its ring is (play_stats), so awaitDeviceDrain gates the ring
+// CEILING (never overfills → no dropped frames) and the drain switches to a faster
+// burst pace (burstPacingMs) whenever the ring runs LOW (a fresh track, a Wi-Fi hiccup)
+// so the ~2.5 s of on-device margin is rebuilt in seconds instead of tens of seconds.
+// Tracks hand off gaplessly: the jukebox prefetches the next track's pipeline while the
+// current one plays (prefetchYoutube / onNearEnd) and can crossfade the two
+// (setCrossfadeSecs) — the tail of one track is mixed into the head of the next
+// server-side, equal-power, before it ever reaches the device.
 //   - speak(text)      ElevenLabs pcm_16000 → stream (emotion tags come inline
 //                      from Sienna's own text; not re-enhanced)
 //   - playUrl(url)     ffmpeg-decoded file/URL → 16 kHz mono → stream
@@ -73,22 +77,37 @@ export function createAudioOut({
                          // delivery banks her short reply on-device so a mid-reply network blip
                          // still completes from the buffer. Live-tunable via the dashboard
                          // slider (see TTS_PACE_MIN/MAX). DELIVERY rate, not speech speed.
-  musicPacingMs = 128,   // MUSIC sent-frame pacing (streamStdoutBuffered). 128 ms = EXACT
-                         // realtime (frame audio = 128 ms): the 1.6× voice rate would overrun
-                         // the device's fixed-rate DAC on a long track, pinning its playback
-                         // ring full so every burst overflows → DROPPED frames (choppy). The
-                         // device gates backpressure on its SOCKET, not the ring, so it can't
-                         // stop this; we must not over-deliver. At realtime net ring fill ≈ 0,
-                         // and the device's deep ring (~2.56 s) absorbs jitter both ways, so it
-                         // neither overflows nor underruns. Lower toward 120 only if you still
-                         // hear gaps (accepting slow overflow on long tracks).
+  musicPacingMs = 128,   // MUSIC sent-frame STEADY-STATE pacing (streamSourceBuffered).
+                         // 128 ms = exact realtime (frame audio = 128 ms). Faster than
+                         // realtime tops the device ring up until the ring-fill gate in
+                         // awaitDeviceDrain (QUEUED_HIGH, from the firmware's play_stats)
+                         // pauses delivery, so over-delivery can no longer overflow the
+                         // ring; the slider just sets how eagerly the ring is kept full.
+  burstBelowMs = 1000,   // BURST FILL: while the device reports fewer than this many ms of
+                         // audio queued ahead of its speaker (a fresh track starts into an
+                         // EMPTY ring; a Wi-Fi hiccup drains it), the music drain paces at
+                         // burstPacingMs instead of musicPacingMs so the margin is rebuilt in
+                         // ~2 s instead of ~20 s. 0 disables. Needs firmware that reports
+                         // play_stats (older firmware ⇒ deviceAudioQueued() is null ⇒ no burst).
+  burstPacingMs = 80,    // inter-frame sleep while bursting (~1.6× realtime; ≥ 64 ms keeps the
+                         // frame COUNT under the device's ~15 frames/s service ceiling).
+  crossfadeSecs = 0,     // CROSSFADE between consecutive jukebox tracks (seconds, 0 = hard
+                         // cut). Live-tunable (setCrossfadeSecs — the dashboard dial); read
+                         // when a track nears its end, frozen once a fade starts. Bounded by
+                         // CROSSFADE_MAX below; needs the next track prefetched (jukebox).
+  onCrossfadeChange = null, // fired when setCrossfadeSecs changes the live value (broadcast + persist)
   maxSeconds = 600,
   firstChars = 60,      // sentence-chunker: small first chunk → fast first audio
   targetChars = 200,    // …then coalesce toward this (protects eleven_v3 prosody)
   prebufferMs = 2000,         // buffered spawn paths: cushion of audio before the
                               // first frame so a stall can't underrun the device
   prebufferTimeoutMs = 5000,  // …but start anyway after this if the source is slow
-  maxBufferMs = 8000,         // queue high-water mark → backpressure to ffmpeg/yt-dlp
+  maxBufferMs = 20000,        // queue high-water mark → backpressure to ffmpeg/yt-dlp. ALSO
+                              // the prefetch lead: the producer reaches the source's EOF
+                              // while this much audio is still queued, and that EOF is what
+                              // triggers the next track's prefetch (onNearEnd) — so it must
+                              // comfortably cover yt-dlp's ~3-4 s resolve + the longest
+                              // crossfade (CROSSFADE_MAX). ~640 KB of PCM at 20 s.
   leadInTimeoutMs = 4000,     // lead-in: max wait for an in-flight announcement to finish
   tailMs = 0,                 // post-speech echo-tail MARGIN: isPlayingOrTail() stays true this
                               // long PAST the device finishing the audio we sent (the drain
@@ -120,6 +139,10 @@ export function createAudioOut({
     Math.ceil((maxBufferMs / 1000) * SAMPLE_RATE * 2),
     prebufferBytesDefault * 2,
   );
+  // Burst fill (see burstBelowMs): the device-queued byte level below which the music
+  // drain switches to the faster burst pace. 0 ⇒ off.
+  const burstBelowBytes = Math.max(0, Math.ceil((burstBelowMs / 1000) * SAMPLE_RATE * 2));
+  const burstPace = Math.max(64, Math.round(Number(burstPacingMs) || 80));
   // ---- per-channel playback state ----
   // Two logical channels share the one device speaker: `voice` (her replies /
   // speak / streamPcm / browser TTS) and `music` (jukebox / play_audio_file /
@@ -202,6 +225,29 @@ export function createAudioOut({
     return ttsPace;
   }
 
+  // ---- live crossfade length ----
+  // Seconds of equal-power crossfade between consecutive jukebox tracks (the dashboard
+  // dial). 0 = hard cut. Snapped to CROSSFADE_STEP and clamped; the drain reads it when a
+  // track nears its end (so a mid-track change applies to the NEXT boundary) and freezes
+  // it once a fade is under way. MAX is bounded by the prefetch lead (maxBufferMs): the
+  // fade can only be as long as the tail we still hold in memory when the source hits EOF.
+  const CROSSFADE_MIN = 0;
+  const CROSSFADE_MAX = 8;
+  const CROSSFADE_STEP = 0.5;
+  const clampFade = (s) => {
+    s = Number(s);
+    if (!Number.isFinite(s)) return crossfade;
+    s = Math.round(s / CROSSFADE_STEP) * CROSSFADE_STEP;
+    return s < CROSSFADE_MIN ? CROSSFADE_MIN : s > CROSSFADE_MAX ? CROSSFADE_MAX : s;
+  };
+  let crossfade = clampFade(crossfadeSecs);
+  function setCrossfadeSecs(s) {
+    const next = clampFade(s);
+    if (next !== crossfade) { crossfade = next; if (onCrossfadeChange) onCrossfadeChange(next); }
+    return crossfade;
+  }
+  const crossfadeBytes = () => Math.round(crossfade * SAMPLE_RATE) * 2;
+
   const focused = () => (voice.playing ? voice : music);
   const pttDuckGain = Math.min(100, Math.max(0, pttDuckPercent)) / 100;
   const canTransmit = (ch) =>
@@ -282,6 +328,31 @@ export function createAudioOut({
       duckQueueBytes -= n;
       if (n >= head.length) duckQueue.shift();
       else duckQueue[0] = head.subarray(n);
+    }
+    return out;
+  }
+
+  // ---- crossfade mix ----
+  // Blend frame `a` (the ending track) with `b` (the next track's head) sample-wise
+  // along an EQUAL-POWER ramp: gainA = cos(t·π/2), gainB = sin(t·π/2) with t sweeping
+  // 0→1 over `total` samples (this frame starts at sample k0 of the fade). Equal-power
+  // keeps the perceived loudness flat through the middle of the fade (a linear ramp dips
+  // ~3 dB at the midpoint, and — per mixDuck's lesson — a plain additive sum would push
+  // hot masters over the int16 rail once the ×volume gain lands). A short `b` mixes
+  // silence for the shortfall; the clamp is defensive.
+  function mixCrossfade(a, b, k0, total) {
+    const out = Buffer.from(a);
+    const nA = out.length >> 1;
+    const nB = b.length >> 1;
+    for (let i = 0; i < nA; i++) {
+      const t = total > 0 ? Math.min(1, (k0 + i) / total) : 1;
+      const gA = Math.cos((t * Math.PI) / 2);
+      const gB = Math.sin((t * Math.PI) / 2);
+      const bv = i < nB ? b.readInt16LE(i * 2) : 0;
+      let v = Math.round(out.readInt16LE(i * 2) * gA + bv * gB);
+      if (v > 32767) v = 32767;
+      else if (v < -32768) v = -32768;
+      out.writeInt16LE(v, i * 2);
     }
     return out;
   }
@@ -466,120 +537,257 @@ export function createAudioOut({
     return frames;
   }
 
-  // DECOUPLES reading the source from pacing to the device: a one-loop reader would
-  // let a stall in the source (yt-dlp over
-  // a jittery network) directly stall the paced send → the device's tiny buffer
-  // underruns → choppy audio. Here a producer task drains `stdout` into an in-memory
-  // PCM queue (bounded by maxBufferBytes — backpressure flows down to ffmpeg → yt-dlp
-  // via the pipe) while a separate drain paces frames out. A pre-buffer
+  // ---- buffered PCM source ----
+  // A producer task drains a readable (ffmpeg stdout) into an in-memory PCM queue,
+  // bounded by maxBufferBytes — backpressure flows down to ffmpeg → yt-dlp via the pipe
+  // — so a stall in the source (yt-dlp over a jittery network) never stalls the paced
+  // send to the device. The source outlives any single drain: a PREFETCHED next track
+  // is a source whose producer is already running (buffering its head) before it is
+  // claimed, and a crossfade reads its head (`read`) before its own drain starts.
+  //   queuedBytes / consumedBytes  — bytes waiting / bytes taken by shift()+read()
+  //   sourceDone                   — the readable ended (EOF, kill, or destroy)
+  //   until(pred, {timeoutMs})     — resolves once pred() holds after any progress
+  //   shift() / read(n)            — take the next chunk / exactly n bytes (whole samples)
+  //   abort()                      — stop the producer (the drain / a kill unwinds it)
+  // The producer parks at maxBufferBytes and is woken once the queue drops below
+  // lowWater. lowWater sits just under the cap (≤ 2 s of hysteresis) so the queue is
+  // FULL when the source reaches EOF — that EOF is the prefetch trigger (onNearEnd),
+  // and the queued tail is both the crossfade material and the next track's lead time.
+  const REFILL_HYSTERESIS_BYTES = 2 * SAMPLE_RATE * 2;   // ≤ 2 s between refills
+  function createPcmSource(stdout, { maxBufferBytes = maxBufferBytesDefault, label = "source" } = {}) {
+    let drainWaiter = null;     // drain parked on more-audio / sourceDone / abort
+    let roomWaiter = null;      // producer parked on backpressure (queue full)
+    const listeners = new Set(); // until() predicates, re-checked on every progress
+    const wake = () => { if (drainWaiter) { const w = drainWaiter; drainWaiter = null; w(); } };
+    const signalRoom = () => { if (roomWaiter) { const r = roomWaiter; roomWaiter = null; r(); } };
+    const notify = () => { for (const fn of [...listeners]) fn(); };
+    const src = {
+      label,
+      t0: clock(),              // ≈ spawn time (callers create the source right after spawning)
+      firstByteAt: null,        // first PCM byte out of ffmpeg (≈ yt-dlp extract + decode start)
+      queue: [],                // Buffer[] of raw int16-LE PCM, in arrival order
+      queuedBytes: 0,
+      consumedBytes: 0,
+      sourceDone: false,
+      aborted: false,
+      maxBufferBytes,
+      lowWater: Math.max(0, maxBufferBytes - Math.min(Math.floor(maxBufferBytes / 2), REFILL_HYSTERESIS_BYTES)),
+      producer: null,
+      wake, signalRoom, notify,
+      waitForData: () => new Promise((r) => { drainWaiter = r; }),
+      until(pred, { timeoutMs = 0 } = {}) {
+        if (pred()) return Promise.resolve();
+        return new Promise((resolve) => {
+          let to = null;
+          const fn = () => { if (pred()) { listeners.delete(fn); if (to) clearTimeout(to); resolve(); } };
+          listeners.add(fn);
+          if (timeoutMs > 0) to = setTimeout(() => { listeners.delete(fn); resolve(); }, timeoutMs);
+        });
+      },
+      shift() {
+        const chunk = src.queue.shift();
+        if (!chunk) return undefined;
+        src.queuedBytes -= chunk.length;
+        src.consumedBytes += chunk.length;
+        if (src.queuedBytes < src.lowWater) signalRoom();   // let the producer pull more
+        return chunk;
+      },
+      // Take up to n bytes (whole int16 samples) off the front of the queue, spanning
+      // chunk boundaries. A lone odd byte at the head is merged with the next chunk
+      // (chunk boundaries can split a sample); if nothing follows it yet, stop short.
+      read(n) {
+        n &= ~1;
+        const parts = [];
+        let got = 0;
+        while (got < n && src.queue.length) {
+          let head = src.queue[0];
+          if (head.length < 2) {
+            if (src.queue.length < 2) break;
+            src.queue.shift();
+            head = Buffer.concat([head, src.queue[0]]);
+            src.queue[0] = head;
+          }
+          const take = Math.min(n - got, head.length) & ~1;
+          parts.push(head.subarray(0, take));
+          got += take;
+          if (take >= head.length) src.queue.shift();
+          else src.queue[0] = head.subarray(take);
+        }
+        src.queuedBytes -= got;
+        src.consumedBytes += got;
+        if (src.queuedBytes < src.lowWater) signalRoom();
+        return parts.length === 1 ? parts[0] : Buffer.concat(parts);
+      },
+      abort() {
+        src.aborted = true;
+        wake(); signalRoom(); notify();
+      },
+    };
+    // Producer: pull from the source as fast as it arrives, pausing (backpressure)
+    // once the queue is full. A destroyed/killed stdout throws out of `for await` —
+    // treat that as EOF.
+    src.producer = (async () => {
+      try {
+        for await (const chunk of stdout) {
+          if (src.aborted) break;
+          const buf = Buffer.from(chunk);
+          if (src.firstByteAt === null) { src.firstByteAt = clock(); log(`${label}: first source byte +${src.firstByteAt - src.t0}ms`); }
+          src.queue.push(buf); src.queuedBytes += buf.length;
+          wake(); notify();
+          if (src.queuedBytes >= src.maxBufferBytes) {
+            await new Promise((r) => { roomWaiter = r; });
+            if (src.aborted) break;
+          }
+        }
+      } catch { /* stdout ended/destroyed mid-read → EOF */ }
+      src.sourceDone = true; wake(); notify();
+    })();
+    return src;
+  }
+
+  // DECOUPLES reading the source from pacing to the device (see createPcmSource): the
+  // source's producer buffers ahead while this drain paces frames out. A pre-buffer
   // (prebufferBytes) builds a lead before the FIRST frame so transient source stalls
-  // are absorbed by the queue instead of the device. Returns the integer frame
-  // count consumed by the paced drain (frames dropped while gated still count —
-  // the playback "ran", just silently). Local sources (a WAV file) fill the
-  // prebuffer almost instantly, so they're unaffected beyond a tiny startup delay.
-  async function streamStdoutBuffered(ch, stdout, {
+  // are absorbed by the queue instead of the device — skipped when the source is a
+  // prefetched track that already holds audio, so a track handoff is gapless. Returns
+  // the integer frame count consumed by the paced drain (frames dropped while gated
+  // still count — the playback "ran", just silently).
+  //
+  // Track handoff hooks (music only):
+  //   onNearEnd()  called ONCE when the source nears its end — its producer reached EOF
+  //                (the queue still holds up to maxBufferMs of tail), or the maxSeconds
+  //                cap is within that same lead. Returns the NEXT track's prefetch
+  //                handle (prefetchYoutube) or null. The jukebox uses it to spawn the
+  //                next pipeline while this one plays.
+  //   crossfade    when true and the setting > 0 and the next handle has enough of its
+  //                head buffered, the LAST crossfadeSecs of this source are mixed with
+  //                the FIRST crossfadeSecs of the next (mixCrossfade); the next track's
+  //                own drain then starts that far in (its source's consumedBytes). If the
+  //                next isn't ready in time the handoff is a plain (still gapless) cut.
+  async function streamSourceBuffered(ch, src, {
     prebufferBytes = prebufferBytesDefault,
-    maxBufferBytes = maxBufferBytesDefault,
     prebufferTimeoutMs = prebufferTimeoutMsDefault,
     label = "buffered",   // for timing logs: which path is draining
+    onNearEnd = null,
+    crossfade = false,
   } = {}) {
     const myGen = ch.generation;
-    const t0 = clock();          // ~spawn time (caller spawns just before calling us)
-    let firstByteAt = null;      // first PCM byte out of ffmpeg (≈ yt-dlp extract + decode start)
+    const t0 = src.t0;
+    const maxBufferBytes = src.maxBufferBytes;
     let firstFrameLogged = false;
-    const queue = [];           // Buffer[] of raw int16-LE PCM, in arrival order
-    let queuedBytes = 0;
-    let sourceDone = false;
     let frames = 0;
     let leftover = Buffer.alloc(0);
     const maxFrames = Math.ceil((maxSeconds * SAMPLE_RATE) / chunkSamples);
-    const lowWater = Math.floor(maxBufferBytes / 2);
+    const leadFrames = Math.ceil(maxBufferBytes / frameBytes);   // cap-case near-end lead ≈ the EOF lead
+    const preStarted = src.queuedBytes > 0 || src.consumedBytes > 0 || src.sourceDone;   // a prefetched source
 
     // ---- streaming-health stats (per-track summary; opt-in live sampler) ----
     // deviceBufPeak/pauses/pausedMs come from awaitDeviceDrain (device link
     // saturation); queueMin/underruns track the in-memory PCM queue (source
     // starvation); maxGapMs is the longest silence between transmitted frames
-    // (the audible-stutter magnitude, whichever buffer caused it).
-    const stats = { deviceBufPeak: 0, inFlightPeak: 0, pauses: 0, pausedMs: 0, queueMin: Infinity, underruns: 0, maxGapMs: 0 };
+    // (the audible-stutter magnitude, whichever buffer caused it); burstFrames counts
+    // frames sent at the burst pace (ring low); fadeFrames the crossfaded ones.
+    const stats = { deviceBufPeak: 0, inFlightPeak: 0, pauses: 0, pausedMs: 0, queueMin: Infinity, underruns: 0, maxGapMs: 0, burstFrames: 0, fadeFrames: 0 };
     let lastFrameAt = null;     // clock() of the previous TRANSMITTED frame
     let lastStatAt = t0;        // clock() of the previous live-sampler line
 
-    let drainWaiter = null;     // drain parked on more-audio / sourceDone / abort
-    const wake = () => { if (drainWaiter) { const w = drainWaiter; drainWaiter = null; w(); } };
-    let roomWaiter = null;      // producer parked on backpressure (queue full)
-    const signalRoom = () => { if (roomWaiter) { const r = roomWaiter; roomWaiter = null; r(); } };
-    let prerollWaiter = null;   // pre-roll parked until prebuffer / sourceDone / timeout / abort
-    const wakePreroll = () => { if (prerollWaiter) { const p = prerollWaiter; prerollWaiter = null; p(); } };
+    // ---- track handoff state ----
+    let nearEndFired = false;
+    let nextHandle = null;      // the prefetched next track (from onNearEnd), if any
+    let fade = null;            // { total, done } in samples while a crossfade is under way
+    let fadeDone = false;       // the fade ran to completion — this source's tail is spent
+    const fireNearEnd = (why, remaining) => {
+      if (!onNearEnd || nearEndFired) return;
+      nearEndFired = true;
+      try { nextHandle = onNearEnd() ?? null; } catch (e) { log(`${label}: onNearEnd threw: ${e?.message ?? e}`); }
+      log(`${label}: near-end (${why}) at frame ${frames}, ${remaining} bytes left${nextHandle ? ` — next prefetching (${nextHandle.url})` : ""}`);
+    };
 
     // So abortPlayback() (preempt / stop) can release a parked producer/drain/pre-roll
     // immediately, mirroring how it tears down currentStreamSession.
-    const signals = { wake, signalRoom, wakePreroll };
+    const signals = { wake: src.wake, signalRoom: src.signalRoom, wakePreroll: src.notify };
     ch.currentDrainSignals = signals;
     const clearSignals = () => { if (ch.currentDrainSignals === signals) ch.currentDrainSignals = null; };
-
-    // Producer: pull from the source as fast as it arrives, pausing (backpressure)
-    // once the queue is full. A destroyed/killed stdout throws out of `for await` —
-    // treat that as EOF.
-    const producer = (async () => {
-      try {
-        for await (const chunk of stdout) {
-          if (ch.abort || ch.generation !== myGen) break;
-          const buf = Buffer.from(chunk);
-          if (firstByteAt === null) { firstByteAt = clock(); log(`${label}: first source byte +${firstByteAt - t0}ms`); }
-          queue.push(buf); queuedBytes += buf.length;
-          wake();
-          if (queuedBytes >= prebufferBytes) wakePreroll();
-          if (queuedBytes >= maxBufferBytes) {
-            await new Promise((r) => { roomWaiter = r; });
-            if (ch.abort || ch.generation !== myGen) break;
-          }
-        }
-      } catch { /* stdout ended/destroyed mid-read → EOF */ }
-      sourceDone = true; wake(); wakePreroll();
-    })();
+    const stale = () => ch.abort || ch.generation !== myGen;
+    // Unwind the source: an aborted/superseded drain stops its producer; a clean EOF
+    // just lets it finish. Either way wait for it so the readable is fully consumed.
+    const unwind = async () => {
+      if (stale()) src.abort();
+      src.signalRoom(); src.wake();
+      await src.producer;
+      clearSignals();
+    };
 
     // Pre-roll: hold the device start until we have a cushion (or the source is
     // already done, or we've waited long enough, or we were aborted). Resolved by
     // the producer (prebuffer reached / sourceDone), the timeout, or abortPlayback.
-    if (queuedBytes < prebufferBytes && !sourceDone && !ch.abort && ch.generation === myGen) {
-      let to = null;
-      await new Promise((resolve) => {
-        prerollWaiter = resolve;
-        to = setTimeout(() => { prerollWaiter = null; resolve(); }, prebufferTimeoutMs);
-      });
-      if (to) clearTimeout(to);
+    // A prefetched source already holding audio starts immediately (gapless handoff).
+    if (!preStarted && src.queuedBytes < prebufferBytes && !src.sourceDone && !stale()) {
+      await src.until(() => src.queuedBytes >= prebufferBytes || src.sourceDone || stale(), { timeoutMs: prebufferTimeoutMs });
     }
 
     // Aborted / superseded before we ever started the device: send nothing.
-    if (ch.abort || ch.generation !== myGen) {
-      signalRoom(); await producer; clearSignals();
-      return 0;
-    }
-    log(`${label}: prebuffer ${queuedBytes >= prebufferBytes ? "reached" : (sourceDone ? "source-done" : "timed-out")} +${clock() - t0}ms (${queuedBytes} bytes buffered)`);
+    if (stale()) { await unwind(); return 0; }
+    log(`${label}: prebuffer ${preStarted ? "prefetched" : src.queuedBytes >= prebufferBytes ? "reached" : (src.sourceDone ? "source-done" : "timed-out")} +${clock() - t0}ms (${src.queuedBytes} bytes buffered${src.consumedBytes ? `, ${src.consumedBytes} already crossfaded` : ""})`);
     if (canTransmit(ch) && !arm(ch)) {
-      ch.abort = true; signalRoom(); wake(); await producer; clearSignals();
+      ch.abort = true; await unwind();
       return 0; // device offline (a gated/silent drain proceeds without arming)
     }
     try {
-      while (!ch.abort && ch.generation === myGen) {
-        if (queue.length === 0) {
-          if (sourceDone) break;                         // the only clean exit
+      while (!stale()) {
+        if (src.queue.length === 0) {
+          if (src.sourceDone) {                          // the only clean exit
+            // EOF landed after the last full frame went out (a very short source, or
+            // one whose tail is under a frame): still kick the prefetch so the next
+            // track starts as early as it can.
+            fireNearEnd("eof-at-exit", leftover.length);
+            break;
+          }
           stats.underruns += 1;                          // drain caught the producer ⇒ source starvation
-          await new Promise((r) => { drainWaiter = r; }); // underrun: park, never send torn frames
+          await src.waitForData();                       // underrun: park, never send torn frames
           continue;
         }
-        const chunk = queue.shift();
-        queuedBytes -= chunk.length;
-        if (queuedBytes < stats.queueMin) stats.queueMin = queuedBytes;
-        if (queuedBytes < lowWater) signalRoom();        // let the producer pull more
+        const chunk = src.shift();
+        if (src.queuedBytes < stats.queueMin) stats.queueMin = src.queuedBytes;
         let data = leftover.length ? Buffer.concat([leftover, chunk]) : chunk;
         let off = 0;
         while (data.length - off >= frameBytes) {
-          if (ch.abort || ch.generation !== myGen) break;
-          await awaitResume(ch); if (ch.abort || ch.generation !== myGen) break;
-          await awaitDeviceDrain(ch, stats); if (ch.abort || ch.generation !== myGen) break;
-          const sent = sendFrame(ch, data.subarray(off, off + frameBytes));
-          if (!firstFrameLogged && sent) { firstFrameLogged = true; log(`${label}: FIRST FRAME to device +${clock() - t0}ms (source byte→frame ${firstByteAt === null ? "?" : clock() - firstByteAt}ms)`); }
+          if (stale()) break;
+          // Near-end: fire the prefetch hook once, as soon as the tail is in hand.
+          const remaining = (data.length - off) + src.queuedBytes;   // bytes of THIS source still unsent
+          if (src.sourceDone || frames >= maxFrames - leadFrames) fireNearEnd(src.sourceDone ? "eof" : "cap", remaining);
+          // Crossfade start: once the remaining tail is no longer than the fade (or, at the
+          // cap, once the cap is that close), and the next track has that much head
+          // buffered. Re-evaluated every frame until it starts — a late-arriving next
+          // track still gets a (shorter) fade; if it never arrives, a plain handoff.
+          if (crossfade && !fade && !fadeDone && nextHandle) {
+            const fadeBytes = crossfadeBytes();
+            const nsrc = nextHandle.source;
+            let want = Math.floor(fadeBytes / frameBytes);
+            if (nsrc.sourceDone) want = Math.min(want, Math.floor(nsrc.queuedBytes / frameBytes));   // a short next track
+            if (want >= 1) {
+              const inWindow = src.sourceDone ? remaining < (want + 1) * frameBytes : frames >= maxFrames - want;
+              if (inWindow) {
+                const n = src.sourceDone ? Math.floor(remaining / frameBytes) : maxFrames - frames;
+                if (n >= 1 && nextHandle.alive() && nsrc.queuedBytes >= n * frameBytes) {
+                  fade = { total: n * chunkSamples, done: 0 };
+                  log(`${label}: crossfade start — ${n} frames (${((n * frameBytes) / (SAMPLE_RATE * 2)).toFixed(2)} s) into ${nextHandle.url}`);
+                }
+              }
+            }
+          }
+          await awaitResume(ch); if (stale()) break;
+          await awaitDeviceDrain(ch, stats); if (stale()) break;
+          let frame = data.subarray(off, off + frameBytes);
+          if (fade) {
+            const b = nextHandle.source.read(frameBytes);
+            frame = mixCrossfade(frame, b, fade.done, fade.total);
+            fade.done += chunkSamples;
+            stats.fadeFrames += 1;
+            if (fade.done >= fade.total) { fade = null; fadeDone = true; nextHandle.fadeComplete = true; }
+          }
+          const sent = sendFrame(ch, frame);
+          if (!firstFrameLogged && sent) { firstFrameLogged = true; log(`${label}: FIRST FRAME to device +${clock() - t0}ms (source byte→frame ${src.firstByteAt === null ? "?" : clock() - src.firstByteAt}ms)`); }
           if (sent) {
             const now = clock();
             if (lastFrameAt !== null && now - lastFrameAt > stats.maxGapMs) stats.maxGapMs = now - lastFrameAt;
@@ -588,24 +796,41 @@ export function createAudioOut({
           if (audioStatsMs > 0 && clock() - lastStatAt >= audioStatsMs) {
             lastStatAt = clock();
             const f = deviceInFlight();
-            log(`audio-stats ${ch.name} t=${clock() - t0}ms: deviceBuf=${deviceBuffered()}/${stats.deviceBufPeak} inflight=${f == null ? "?" : f}/${stats.inFlightPeak} queue=${queuedBytes} pauses=${stats.pauses} underruns=${stats.underruns} maxGap=${stats.maxGapMs}ms`);
+            log(`audio-stats ${ch.name} t=${clock() - t0}ms: deviceBuf=${deviceBuffered()}/${stats.deviceBufPeak} inflight=${f == null ? "?" : f}/${stats.inFlightPeak} queue=${src.queuedBytes} pauses=${stats.pauses} underruns=${stats.underruns} burst=${stats.burstFrames} maxGap=${stats.maxGapMs}ms`);
           }
           off += frameBytes; frames += 1;
           if (frames >= maxFrames) { ch.abort = true; break; }
-          await sleep(sent ? musicPace : frameMs);   // live-tunable (dashboard slider)
+          // A completed EOF fade consumed this source's tail: what's left is < 1 frame
+          // at gain ≈ 0 — drop it (keeps the next track frame-aligned) and hand off.
+          if (fadeDone && src.sourceDone) break;
+          // Pacing: the steady-state music pace, or the burst pace while the device
+          // reports a low ring (fresh track / hiccup) so its margin refills quickly.
+          let pace = musicPace;
+          if (sent && burstBelowBytes > 0) {
+            const q = deviceQueued();
+            if (q != null && q < burstBelowBytes) { pace = Math.min(burstPace, musicPace); stats.burstFrames += 1; }
+          }
+          await sleep(sent ? pace : frameMs);   // live-tunable (dashboard slider)
         }
+        if (fadeDone && src.sourceDone) break;
         leftover = Buffer.from(data.subarray(off));
       }
-      if (!ch.abort && ch.generation === myGen && leftover.length) { sendFrame(ch, leftover); frames += 1; }
+      if (!stale() && !fadeDone && leftover.length) { sendFrame(ch, leftover); frames += 1; }
     } finally {
       disarm(ch);
-      signalRoom(); wake(); await producer; clearSignals();
+      await unwind();
     }
     log(`${label}: drain done frames=${frames} in ${clock() - t0}ms`
       + ` | deviceBuf peak=${stats.deviceBufPeak} (HIGH=${BACKPRESSURE_HIGH}) inflight peak=${stats.inFlightPeak} (HIGH=${INFLIGHT_HIGH}) pauses=${stats.pauses} pausedMs=${stats.pausedMs}`
       + ` | queue min=${stats.queueMin === Infinity ? 0 : stats.queueMin}/${maxBufferBytes} underruns=${stats.underruns}`
-      + ` | maxGap=${stats.maxGapMs}ms`);
+      + ` | maxGap=${stats.maxGapMs}ms burst=${stats.burstFrames} fade=${stats.fadeFrames}`);
     return frames;
+  }
+
+  // The classic entry point: wrap a readable (ffmpeg stdout) in a fresh source and drain it.
+  function streamStdoutBuffered(ch, stdout, opts = {}) {
+    const { maxBufferBytes, ...rest } = opts;
+    return streamSourceBuffered(ch, createPcmSource(stdout, { maxBufferBytes, label: opts.label ?? "buffered" }), rest);
   }
 
   async function withPlayback(ch, fn) {
@@ -886,6 +1111,44 @@ export function createAudioOut({
     });
   }
 
+  // PREFETCH a track: spawn its yt-dlp | ffmpeg pipeline AND start buffering its PCM
+  // (createPcmSource, up to maxBufferMs, then parked on backpressure) WITHOUT claiming
+  // the device or the music channel. The jukebox calls this from onNearEnd so the next
+  // track's audio is in memory before the current one ends; playYoutubeTrack(handle)
+  // then claims it (no spawn, no pre-roll wait ⇒ a gapless handoff), and a crossfade
+  // reads its head first. The handle is NOT in music.procs, so abortPlayback / stop()
+  // never touch it — whoever prefetched it owns it and must kill() it if it goes unused.
+  //   usable()  — never claimed, still alive, and its head is either untouched or was
+  //               consumed by a COMPLETED crossfade (a fade aborted midway leaves the
+  //               head half-spent ⇒ playYoutubeTrack respawns from the top instead).
+  function prefetchYoutube(url, label = "prefetch") {
+    const h = spawnYoutube(url, label);
+    const source = createPcmSource(h.ff.stdout, { label });
+    const handle = {
+      url, source,
+      yt: h.yt, ff: h.ff, ytClosed: h.ytClosed, ffClosed: h.ffClosed, errRef: h.errRef,
+      createdAt: clock(),
+      claimed: false,
+      killed: false,
+      fadeComplete: false,
+      get consumedBytes() { return source.consumedBytes; },
+      alive: () => !handle.killed && !h.errRef.spawnErr,
+      usable: () => handle.alive() && !handle.claimed && (source.consumedBytes === 0 || handle.fadeComplete),
+      isReady: (bytes) => source.queuedBytes >= bytes || source.sourceDone,
+      kill: async () => {
+        if (handle.killed) return;
+        handle.killed = true;
+        source.abort();
+        for (const p of [h.yt, h.ff]) {
+          if (p.exitCode === null && !p.killed) { try { p.kill("SIGKILL"); } catch { /* already gone */ } }
+        }
+        await Promise.all([h.ytClosed, h.ffClosed]);
+        await source.producer;
+      },
+    };
+    return handle;
+  }
+
   // Like playYoutube, but AWAITED to completion and reporting WHY it ended, so an
   // autoplay queue (jukebox.js) knows whether to advance, stop, or resume:
   //   "ended"      natural EOF or the maxSeconds cap   → play the next track
@@ -893,9 +1156,25 @@ export function createAudioOut({
   //   "superseded" another playback preempted us (her  → wait for the speaker, then
   //                auto-spoken reply / speak tool)        resume the mix
   //   "error"      yt-dlp/ffmpeg failed for this track → skip to the next
+  // `target` is a URL (spawn now) or a prefetchYoutube handle (claim it: its pipeline
+  // is already running and its audio already buffered). `onNearEnd` is forwarded to
+  // the drain (see streamSourceBuffered) — the jukebox's prefetch hook.
   // Returns { reason, frames } (frames === 0 ⇒ device was offline ⇒ caller should bail).
-  async function playYoutubeTrack(url, { leadIn = false } = {}) {
-    const handle = spawnYoutube(url, `playYoutubeTrack${leadIn ? " (lead-in)" : ""}`);
+  async function playYoutubeTrack(target, { leadIn = false, onNearEnd = null } = {}) {
+    const label = `playYoutubeTrack${leadIn ? " (lead-in)" : ""}`;
+    let handle;
+    if (typeof target === "string") {
+      handle = prefetchYoutube(target, label);
+    } else if (target.usable()) {
+      handle = target;
+      log(`${label}: claiming prefetched pipeline for ${handle.url} (${handle.source.queuedBytes} bytes buffered, ${handle.source.consumedBytes} consumed by crossfade)`);
+    } else {
+      const why = target.killed ? "killed" : target.claimed ? "already claimed" : !target.alive() ? "spawn failed" : "partially consumed by an aborted crossfade";
+      log(`${label}: prefetched pipeline for ${target.url} is unusable (${why}) — respawning`);
+      await target.kill();
+      handle = prefetchYoutube(target.url, label);
+    }
+    handle.claimed = true;
     if (leadIn) {
       // A new playback request supersedes an old stop: clear the stale flag so a
       // stop that landed BEFORE this request can't kill the fresh pipeline. A stop
@@ -904,8 +1183,7 @@ export function createAudioOut({
       const startGen = music.generation;
       await waitForSpeakerIdle(leadInTimeoutMs);
       if (music.userStopped || music.generation !== startGen) {   // stop/preempt landed during the lead-in
-        for (const p of [handle.yt, handle.ff]) { try { p.kill("SIGKILL"); } catch { /* gone */ } }
-        await Promise.all([handle.ytClosed, handle.ffClosed]);
+        await handle.kill();
         return { reason: music.userStopped ? "stopped" : "superseded", frames: 0 };
       }
     }
@@ -915,7 +1193,7 @@ export function createAudioOut({
       music.procs.push(yt, ff);
       yt.on("error", () => { music.abort = true; });   // post-claim: now `abort` is ours
       ff.on("error", () => { music.abort = true; });
-      const frames = await streamStdoutBuffered(music, ff.stdout, { label: "playYoutubeTrack" });
+      const frames = await streamSourceBuffered(music, handle.source, { label: "playYoutubeTrack", onNearEnd, crossfade: true });
       // The cap path (and device-offline early return) stop reading but leave the
       // children running — force the still-alive ones down so their close events
       // fire. EOF / preempt / user-stop have already ended them.
@@ -981,7 +1259,7 @@ export function createAudioOut({
   }
 
   return {
-    streamPcm, speak, speakStream, playUrl, playYoutube, playYoutubeTrack,
+    streamPcm, speak, speakStream, playUrl, playYoutube, playYoutubeTrack, prefetchYoutube,
     stop, hardStop, pause, resume,
     mute, unmute,
     isMuted: () => muted,
@@ -1002,5 +1280,10 @@ export function createAudioOut({
     setTtsPacingMs,
     getTtsPacingMs: () => ttsPace,
     ttsPacingBounds: () => ({ min: TTS_PACE_MIN, max: TTS_PACE_MAX }),
+    // Live crossfade length between jukebox tracks (dashboard dial): applies at the
+    // next track boundary.
+    setCrossfadeSecs,
+    getCrossfadeSecs: () => crossfade,
+    crossfadeBounds: () => ({ min: CROSSFADE_MIN, max: CROSSFADE_MAX, step: CROSSFADE_STEP }),
   };
 }

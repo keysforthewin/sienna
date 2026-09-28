@@ -129,6 +129,35 @@ export function createJukebox({
   let suspendFroze = false;  // suspend() did the audioOut freeze (vs an existing user pause)
   let suspendWaiter = null;  // run loop parked on the suspend gate
   const wakeSuspendGate = () => { if (suspendWaiter) { const w = suspendWaiter; suspendWaiter = null; w(); } };
+  // Next-track PREFETCH: the warm yt-dlp|ffmpeg pipeline (audioOut.prefetchYoutube) for
+  // the track that follows the one playing, spawned from the drain's onNearEnd hook
+  // (~maxBufferMs before the end) so the boundary is gapless — and, when the crossfade
+  // dial is up, so the drain can mix its head under the current track's tail. At most
+  // one outstanding; keyed by URL and reconciled at the next loop turn (reused when it
+  // is the track we're about to play, killed otherwise). We own it until it's claimed:
+  // audioOut never kills an unclaimed prefetch, so every path that abandons the plan
+  // (stop, new session, suspend, supersede) must discard it here.
+  let prefetched = null;     // { url, handle }
+  function discardPrefetch(why) {
+    if (!prefetched) return;
+    const p = prefetched;
+    prefetched = null;
+    log(`prefetch discarded (${why}): ${p.url}`);
+    Promise.resolve(p.handle.kill()).catch(() => {});
+  }
+  // The entry the loop will play after queue[index], applying the same play-time
+  // freshness rule the loop applies (skip entries already in the play history unless
+  // the queue is exempt / allows repeats). null when the next track isn't knowable yet:
+  // a single-song session graduates to a continuation search (advance() empties the
+  // queue), or the queue is exhausted (a refill happens first). No prefetch across a
+  // refill — the next track isn't known until the search returns.
+  function nextFreshEntry() {
+    if (continuationQuery) return null;
+    for (let j = index + 1; j < queue.length; j++) {
+      if (queueExempt || queueAllowsRepeats || !inWindow(queue[j])) return queue[j];
+    }
+    return null;
+  }
 
   // Now-playing change seam: fire on every state transition a listener would care
   // about (track start, title fill-in, pause/resume, stop, session end). Isolated
@@ -374,6 +403,7 @@ export function createJukebox({
   function startSession(term, tracks, { leadIn = false, continuation = null, allowRepeats = false, confirm = false } = {}) {
     settleFirst(firstOutcome, "superseded");   // any prior awaiter must not hang
     firstOutcome = confirm ? makeOutcome() : null;
+    discardPrefetch("new session");            // the new queue makes any warm next-track stale
     query = term;
     continuationQuery = continuation;
     queue = tracks;
@@ -550,7 +580,28 @@ export function createJukebox({
       const trackStart = clock();
       log(`track start [${index}]: "${trackTitle}" (${current.url})${leadIn ? " [lead-in]" : ""}`);
       const playedEntry = current;              // capture: a new loop may reassign `current` while we play
-      const { reason, frames } = await audioOut.playYoutubeTrack(current.url, { leadIn });
+      // Reconcile the prefetch: reuse it if it IS this track (the common case, incl. a
+      // skip straight into it), otherwise it's stale — kill it and spawn fresh.
+      let target = current.url;
+      if (prefetched) {
+        if (prefetched.url === current.url) { target = prefetched.handle; prefetched = null; }
+        else discardPrefetch("url mismatch");
+      }
+      // Near-end hook (fired once by the drain, ~maxBufferMs before the end): spawn the
+      // NEXT track's pipeline so it's buffered before this one ends, and hand the drain
+      // its handle for a possible crossfade. Stale loops / a suspended session decline.
+      const onNearEnd = () => {
+        if (myGen !== generation || suspended) return null;
+        const next = nextFreshEntry();
+        if (!next) { log("near-end: nothing to prefetch (refill / continuation ahead)"); return null; }
+        if (prefetched && prefetched.url !== next.url) discardPrefetch("next changed");
+        if (!prefetched) {
+          prefetched = { url: next.url, handle: audioOut.prefetchYoutube(next.url) };
+          log(`prefetching next: "${next.title}" (${next.url})`);
+        }
+        return prefetched.handle;
+      };
+      const { reason, frames } = await audioOut.playYoutubeTrack(target, { leadIn, onNearEnd });
       log(`track end [${index}]: "${trackTitle}" reason=${reason} frames=${frames} after ${clock() - trackStart}ms`);
       if (frames > 0) { recordPlayed(playedEntry); settleFirst(myOutcome, "started"); }
       if (myGen !== generation) return;         // a control method took over while we played
@@ -562,6 +613,10 @@ export function createJukebox({
         // in-flight fused play() await doesn't wait the full startConfirmMs.
         // Idempotent: a prior "started" settle is a no-op.
         settleFirst(myOutcome, "superseded");
+        // The warm next-track pipeline would sit parked on backpressure for however
+        // long her speech runs (a stalled download can expire) — and the replay of THIS
+        // track re-fires onNearEnd anyway, so drop it now.
+        discardPrefetch("superseded");
         // An interjection suspended us (paused): don't auto-replay over the open
         // conversation window (that would re-gate the mic). Orphan instead — resume()
         // restarts the track once the interjection ends. Checked both before AND after
@@ -609,7 +664,7 @@ export function createJukebox({
       recoveryAttempts = 0;                      // a track actually played — fresh slate
       advance();
     }
-    if (myGen === generation) { active = false; paused = false; current = null; clearSession(); notify(); }
+    if (myGen === generation) { discardPrefetch("session ended"); active = false; paused = false; current = null; clearSession(); notify(); }
   }
 
   // ---- public control surface (tool-result convention: { ok, text } | { ok:false, error }) ----
@@ -738,6 +793,10 @@ export function createJukebox({
     if (!active || suspended) return false;
     suspended = true;
     suspendFroze = !paused && audioOut.pause();
+    // A prefetched next track parked on backpressure across a device outage of unknown
+    // length is a stall risk (see "superseded"); drop it — the cost is one old-style
+    // gap at the current track's end after the reconnect (onNearEnd fires once).
+    discardPrefetch("suspend");
     return true;
   }
 
@@ -753,6 +812,7 @@ export function createJukebox({
 
   function stop() {
     generation += 1;
+    discardPrefetch("stop");
     // Promptly resolve any in-flight fused play() await so it doesn't stall
     // the full startConfirmMs (8s) waiting for a first-track outcome that will
     // never arrive. Idempotent — a prior "started"/"empty" settle is a no-op.

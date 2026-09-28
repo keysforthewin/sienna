@@ -370,6 +370,43 @@ and fired device timers all feed the same `agent.run(input, {source})`. Modules
   seconds of audio queued ahead of the firmware heartbeat's pong (3 s timeout × 2)
   and the device dropped the link (1006) every ~22 s during music. Old firmware /
   a report older than 5 s ⇒ null ⇒ legacy bufferedAmount gate only.
+  **Gapless track handoff (prefetch + burst fill + crossfade):** every jukebox
+  track boundary used to stutter — track A hit EOF, only THEN did the jukebox
+  spawn `yt-dlp | ffmpeg` for B (first PCM ~3.2 s later, but the device ring held
+  ~2.2 s ⇒ ~1 s of dead air), and B started into an EMPTY ring at ~1.3× realtime
+  so it took ~20 s to rebuild margin (2–3 underrun clicks per boundary in the
+  logs). Now: (1) the buffered drain's producer lives in `createPcmSource`, a
+  source object that outlives a single drain; `audioOut.prefetchYoutube(url)`
+  spawns B's pipeline and buffers its head WITHOUT claiming the device, and the
+  drain fires **`onNearEnd()` once** when A's producer reaches EOF (the in-memory
+  queue still holds up to `SIENNA_PLAYBACK_MAX_BUFFER_MS` — now **20 s**, which is
+  therefore the prefetch lead; the producer refills within ~2 s of the cap so the
+  queue is full at EOF) or when the 10-min cap is that close. `jukebox.js` answers
+  it by prefetching the next fresh queue entry (none across a refill /
+  continuation — the next track isn't known yet), reconciles by URL at the next
+  loop turn (`playYoutubeTrack(handle)` claims it: no spawn, no pre-roll wait;
+  a skip reuses it too), and kills it on stop / new session / suspend /
+  superseded (a pipeline parked on backpressure for minutes can stall). An
+  unclaimed prefetch is never in `music.procs`, so `abortPlayback`/`stop()`
+  can't touch it — the jukebox owns it. (2) **Burst fill:** while the device
+  reports < `SIENNA_MUSIC_BURST_BELOW_MS` (1 s) queued ahead of its speaker, the
+  music drain paces at `SIENNA_MUSIC_BURST_PACING_MS` (80 ms) instead of the
+  slider's `musicPacingMs`; the ring-fill ceiling in `awaitDeviceDrain` stops it
+  overfilling, so the old "music must pace at exactly realtime" rule is gone.
+  (3) **Crossfade:** `setCrossfadeSecs` (0–8 s, 0.5 steps, default 0 = hard
+  cut; the **Crossfade dial** beside the pacing sliders in the Voice panel,
+  `set_crossfade`/`crossfade` messages, persisted as the `music_crossfade`
+  setting like the pacing sliders) — when > 0 and B has that much head
+  buffered, A's drain mixes its last N seconds with B's first N (`mixCrossfade`,
+  equal-power cos/sin ramp, clamped) and B's own drain then starts N seconds in
+  (`source.consumedBytes`). A fade aborted midway leaves B half-spent ⇒
+  `usable()` is false and it's respawned from the top. Crossfade only happens at
+  a natural end / the cap; skip is a hard cut. The per-track
+  `play_audio_end` → `play_audio_start` pair is kept on purpose: dropping it
+  would leave the device `gPlaybackActive` with an empty ring when no track
+  follows (mic gated forever) and make a later voice `arm` flush A's tail.
+  The drain summary logs `burst=N fade=N`; the knob widget is the shared
+  `public/js/panels/knob.js` factory (the volume knobs use it too).
   `isPlaying()`/`isPlayingOrTail()` are her-voice predicates and false while
   muted (the PTT mic gate depends on it). Her reply no longer supersedes a
   jukebox track — the jukebox's superseded/replay path only fires for

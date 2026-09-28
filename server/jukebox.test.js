@@ -29,6 +29,8 @@ function makeSearch(linesByCall) {
 function makeAudio({ reasons = [], playing = false } = {}) {
   const tracks = [];
   const trackOpts = [];
+  const targets = [];      // raw playYoutubeTrack targets (a URL string or a prefetch handle)
+  const prefetches = [];   // prefetchYoutube handles handed out
   let stops = 0, pauses = 0, resumes = 0;
   let i = 0;
   let isPlayingVal = playing;
@@ -47,7 +49,16 @@ function makeAudio({ reasons = [], playing = false } = {}) {
     stop: () => { stops++; isPlayingVal = false; pausedVal = false; },
     pause: () => { pauses++; pausedVal = true; return true; },
     resume: () => { resumes++; pausedVal = false; return true; },
-    playYoutubeTrack: async (url, opts = {}) => {
+    targets,
+    prefetches,
+    prefetchYoutube: (u) => {
+      const h = { url: u, kills: 0, kill: async () => { h.kills += 1; }, usable: () => h.kills === 0, source: {} };
+      prefetches.push(h);
+      return h;
+    },
+    playYoutubeTrack: async (target, opts = {}) => {
+      targets.push(target);
+      const url = typeof target === "string" ? target : target.url;
       tracks.push(url);
       trackOpts.push(opts);
       const r = reasons[i] || { reason: "ended", frames: 1 };
@@ -1327,4 +1338,119 @@ test("restoreSession is a no-op with nothing saved", async () => {
   const jb = createJukebox({ audioOut: makeAudio(), memory: makeMemoryFake(), spawn, sleep: async () => {} });
   assert.equal(await jb.restoreSession(), false);
   assert.equal(jb.isActive(), false);
+});
+
+
+// --- next-track prefetch (gapless handoff) ---
+
+test("onNearEnd prefetches the next queue entry; the next loop turn reuses the handle", async () => {
+  const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }, { id: "c" }]]);
+  let resolveA;
+  const audio = makeAudio({ reasons: [() => new Promise((r) => { resolveA = r; }), () => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  const h = audio.trackOpts[0].onNearEnd();
+  assert.equal(h.url, url("b"));
+  assert.equal(audio.prefetches.length, 1);
+  assert.equal(audio.trackOpts[0].onNearEnd(), h, "a second call returns the same outstanding prefetch");
+  resolveA({ reason: "ended", frames: 1 });
+  await waitFor(() => audio.tracks.length === 2);
+  assert.equal(audio.targets[1], h, "track b plays from the prefetched pipeline");
+  assert.equal(h.kills, 0);
+});
+
+test("onNearEnd skips entries already in the play history, matching what the loop will play", async () => {
+  const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }, { id: "c" }]]);
+  let resolveA;
+  const audio = makeAudio({ reasons: [() => new Promise((r) => { resolveA = r; }), () => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  jb.notePlayed({ id: "b", title: "B" });      // b entered the window while a plays
+  await settle();                              // notePlayed records asynchronously
+  const h = audio.trackOpts[0].onNearEnd();
+  assert.equal(h.url, url("c"));
+  resolveA({ reason: "ended", frames: 1 });
+  await waitFor(() => audio.tracks.length === 2);
+  assert.deepEqual(audio.tracks, [url("a"), url("c")]);
+  assert.equal(audio.targets[1], h);
+});
+
+test("no prefetch when the queue is exhausted (a refill decides the next track)", async () => {
+  const { spawn } = makeSearch([[{ id: "a" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  assert.equal(audio.trackOpts[0].onNearEnd(), null);
+  assert.equal(audio.prefetches.length, 0);
+});
+
+test("skip reuses the prefetched next track (instant switch, no fade)", async () => {
+  const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }, { id: "c" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {}), () => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  const h = audio.trackOpts[0].onNearEnd();
+  jb.skip();
+  await waitFor(() => audio.tracks.length === 2);
+  assert.equal(audio.targets[1], h);
+  assert.equal(h.kills, 0);
+});
+
+test("the prefetch is killed on stop, suspend, supersede, and a new session", async () => {
+  // stop
+  {
+    const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }]]);
+    const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+    const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+    await jb.play({ query: "x" });
+    const h = audio.trackOpts[0].onNearEnd();
+    jb.stop();
+    assert.equal(h.kills, 1);
+  }
+  // suspend (device dropped)
+  {
+    const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }]]);
+    const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+    const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+    await jb.play({ query: "x" });
+    const h = audio.trackOpts[0].onNearEnd();
+    jb.suspend();
+    assert.equal(h.kills, 1);
+    assert.equal(audio.trackOpts[0].onNearEnd(), null, "no prefetch while suspended");
+  }
+  // superseded (her speech took the speaker → replay later)
+  {
+    const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }]]);
+    let resolveA;
+    const audio = makeAudio({ reasons: [() => new Promise((r) => { resolveA = r; }), () => new Promise(() => {})] });
+    const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+    await jb.play({ query: "x" });
+    const h = audio.trackOpts[0].onNearEnd();
+    resolveA({ reason: "superseded", frames: 1 });
+    await waitFor(() => h.kills === 1);
+    await waitFor(() => audio.tracks.length === 2);
+    assert.deepEqual(audio.tracks, [url("a"), url("a")], "replays a from the top");
+    assert.equal(audio.targets[1], url("a"), "…from a fresh URL, not the stale handle");
+  }
+  // new session
+  {
+    const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }]]);
+    const audio = makeAudio({ reasons: [() => new Promise(() => {}), () => new Promise(() => {})] });
+    const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+    await jb.play({ query: "x" });
+    const h = audio.trackOpts[0].onNearEnd();
+    await jb.play({ query: "y" });
+    assert.equal(h.kills, 1);
+  }
+});
+
+test("a stale loop's onNearEnd (after a generation bump) prefetches nothing", async () => {
+  const { spawn } = makeSearch([[{ id: "a" }, { id: "b" }, { id: "c" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {}), () => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  jb.skip();
+  await waitFor(() => audio.tracks.length === 2);
+  assert.equal(audio.trackOpts[0].onNearEnd(), null);
+  assert.equal(audio.prefetches.length, 0);
 });

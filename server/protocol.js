@@ -215,6 +215,12 @@ export const SetTtsPacingCmd = z.object({
   type: z.literal("set_tts_pacing"), ref: ref,
   ms: z.number().int().min(40).max(300),
 });
+// Consumed server-side: the crossfade dial — seconds of crossfade between jukebox
+// tracks (fractional; audio-out.js snaps to its step). Never forwarded to the device.
+export const SetCrossfadeCmd = z.object({
+  type: z.literal("set_crossfade"), ref: ref,
+  secs: z.number().min(0).max(8),
+});
 
 export const BrowserMsg = z.discriminatedUnion("type", [
   SetBlueLedCmd, SetBlueFlashCmd, SetFlashLedCmd, SetRgbCmd,
@@ -224,7 +230,7 @@ export const BrowserMsg = z.discriminatedUnion("type", [
   PlayToneCmd, PlayAudioStartCmd, PlayAudioEndCmd, StopAudioCmd,
   SnapshotCmd, RebootCmd,
   ScanWifiCmd, ScanBleCmd, SetTimerCmd, CancelTimerCmd,
-  AgentInputCmd, SetAutonomyCmd, SetVolumeCmd, SetMusicPacingCmd, SetTtsPacingCmd,
+  AgentInputCmd, SetAutonomyCmd, SetVolumeCmd, SetMusicPacingCmd, SetTtsPacingCmd, SetCrossfadeCmd,
   PttCmd,
 ]);
 

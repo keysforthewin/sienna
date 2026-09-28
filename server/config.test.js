@@ -78,3 +78,16 @@ test("speak-listen disable via env", () => {
   const c = loadConfig({ ...MINIMAL, SIENNA_SPEAK_LISTEN: "false" });
   assert.equal(c.SIENNA_SPEAK_LISTEN, false);
 });
+
+
+test("gapless-jukebox defaults: 20 s buffer (the prefetch lead), burst fill on, crossfade off", () => {
+  const c = loadConfig(MINIMAL);
+  assert.equal(c.SIENNA_PLAYBACK_MAX_BUFFER_MS, 20000);
+  assert.equal(c.SIENNA_MUSIC_BURST_BELOW_MS, 1000);
+  assert.equal(c.SIENNA_MUSIC_BURST_PACING_MS, 80);
+  assert.equal(c.SIENNA_MUSIC_CROSSFADE_SECS, 0);
+  const d = loadConfig({ ...MINIMAL, SIENNA_MUSIC_CROSSFADE_SECS: "2.5", SIENNA_MUSIC_BURST_BELOW_MS: "0" });
+  assert.equal(d.SIENNA_MUSIC_CROSSFADE_SECS, 2.5);
+  assert.equal(d.SIENNA_MUSIC_BURST_BELOW_MS, 0);
+  assert.throws(() => loadConfig({ ...MINIMAL, SIENNA_MUSIC_CROSSFADE_SECS: "9" }));
+});

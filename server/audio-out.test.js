@@ -1642,3 +1642,204 @@ test("partial-head consumption: a voice leftover partially drains a larger banke
   assert.ok(allPayloads.some((p) => p[0] === 1056),
     `expected partial-head mix [1056], got ${JSON.stringify(allPayloads)}`);
 });
+
+// --- burst fill / prefetch / crossfade (gapless jukebox handoff) ---
+const pcm16 = (...s) => { const b = Buffer.alloc(s.length * 2); s.forEach((v, i) => b.writeInt16LE(v, i * 2)); return b; };
+const samplesOf = (bin) => { const out = []; for (let i = 1; i + 1 < bin.length; i += 2) out.push(bin.readInt16LE(i)); return out; };   // skips the 0x03 tag
+
+test("music drain bursts at burstPacingMs while the device reports a low ring, then settles to musicPacingMs", async () => {
+  let queued = 100;                                  // ~nothing ahead of the speaker (a fresh track)
+  const bridge = { ...makeBridge(), deviceAudioQueued: () => queued };
+  const sleeps = [];
+  const logs = [];
+  const spawn = () => fakeChild([[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]]);   // 3 frames at chunkSamples=2
+  const audio = createAudioOut({
+    bridge, tts: {}, spawn, refGen, chunkSamples: 2, prebufferMs: 0,
+    deviceRingBytes: 1e6,                            // never hit the ring ceiling in this test
+    musicPacingMs: 120, burstBelowMs: 1000, burstPacingMs: 70,
+    sleep: async (ms) => { sleeps.push(ms); if (sleeps.length === 1) queued = 40000; },   // ring refilled after frame 1
+    log: (m) => logs.push(m),
+  });
+  await audio.playUrl("http://example.com/a.mp3");
+  assert.deepEqual(sleeps, [70, 120, 120], "burst pace while low, steady pace once the ring is back");
+  assert.ok(logs.some((m) => /drain done.*burst=1/.test(m)), "summary counts the burst frames");
+});
+
+test("burst fill is off when the device can't report its queue (old firmware) or burstBelowMs=0", async () => {
+  for (const opts of [{ bridge: makeBridge() }, { bridge: { ...makeBridge(), deviceAudioQueued: () => 0 }, burstBelowMs: 0 }]) {
+    const sleeps = [];
+    const spawn = () => fakeChild([[1, 0, 2, 0, 3, 0, 4, 0]]);
+    const audio = createAudioOut({
+      tts: {}, spawn, refGen, chunkSamples: 2, prebufferMs: 0, deviceRingBytes: 1e6,
+      musicPacingMs: 120, burstPacingMs: 70, ...opts,
+      sleep: async (ms) => { sleeps.push(ms); },
+    });
+    await audio.playUrl("http://example.com/a.mp3");
+    assert.ok(sleeps.length >= 1 && sleeps.every((s) => s === 120), `no burst, saw ${sleeps}`);
+  }
+});
+
+test("prefetchYoutube spawns + buffers without touching the device; stop() leaves it alone; kill() tears it down", async () => {
+  const bridge = makeBridge();
+  const spawns = [];
+  const pt = new PassThrough();
+  pt.write(pcm16(1, 2, 3, 4));                       // 8 bytes buffered, stream stays open (a live download)
+  const ffC = fakeChildFromStream(pt);
+  const spawn = (cmd) => { spawns.push(cmd); return cmd === "yt-dlp" ? fakeChild([]) : ffC; };
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0 });
+  const h = audio.prefetchYoutube("https://youtu.be/b");
+  await flush();
+  assert.deepEqual(spawns, ["yt-dlp", "ffmpeg"]);
+  assert.equal(h.source.queuedBytes, 8, "the producer buffers the head immediately");
+  assert.equal(bridge.cmds("play_audio_start").length, 0, "no device arming");
+  assert.equal(bridge.bins.length, 0, "no frames sent");
+  assert.equal(h.usable(), true);
+  audio.stop();
+  assert.equal(ffC.killed, false, "an unclaimed prefetch is owned by its caller, not by stop()");
+  await h.kill();
+  assert.equal(ffC.killed, true);
+  assert.equal(h.usable(), false);
+});
+
+test("playYoutubeTrack(handle) claims a prefetched pipeline: no new spawn, no pre-roll, plays its audio", async () => {
+  const bridge = makeBridge();
+  const spawns = [];
+  const logs = [];
+  const spawn = (cmd) => { spawns.push(cmd); return cmd === "yt-dlp" ? fakeChild([]) : fakeChild([pcm16(1, 2, 3, 4)]); };
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 5000, log: (m) => logs.push(m) });
+  const h = audio.prefetchYoutube("https://youtu.be/b");
+  await flush();
+  const r = await audio.playYoutubeTrack(h);
+  assert.equal(spawns.length, 2, "reused — nothing respawned");
+  assert.equal(r.reason, "ended");
+  assert.equal(r.frames, 2);
+  assert.deepEqual(bridge.bins.map(samplesOf), [[1, 2], [3, 4]]);
+  assert.ok(logs.some((m) => /prebuffer prefetched/.test(m)), "a prefetched source skips the pre-roll wait");
+  assert.equal(h.claimed, true);
+  assert.equal(h.usable(), false, "claimed once");
+});
+
+test("playYoutubeTrack(handle) respawns from the handle's URL when the prefetch was killed", async () => {
+  const bridge = makeBridge();
+  const spawns = [];
+  const spawn = (cmd, args) => { spawns.push({ cmd, args }); return cmd === "yt-dlp" ? fakeChild([]) : fakeChild([pcm16(9, 9)]); };
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0 });
+  const h = audio.prefetchYoutube("https://youtu.be/dead");
+  await flush();
+  await h.kill();
+  const r = await audio.playYoutubeTrack(h);
+  assert.equal(spawns.length, 4, "a fresh yt-dlp + ffmpeg pair");
+  assert.ok(spawns[2].args.includes("https://youtu.be/dead"), "…for the same URL");
+  assert.equal(r.reason, "ended");
+  assert.deepEqual(bridge.bins.map(samplesOf), [[9, 9]]);
+});
+
+test("onNearEnd fires exactly once when the source reaches EOF (the queued tail is the lead)", async () => {
+  const bridge = makeBridge();
+  let calls = 0;
+  const spawn = (cmd) => (cmd === "yt-dlp" ? fakeChild([]) : fakeChild([pcm16(1, 1, 2, 2, 3, 3)]));   // 3 frames
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0 });
+  const r = await audio.playYoutubeTrack("https://youtu.be/a", { onNearEnd: () => { calls += 1; return null; } });
+  assert.equal(r.frames, 3);
+  assert.equal(calls, 1);
+});
+
+test("onNearEnd fires once ~maxBufferMs before the maxSeconds cap on an endless source", async () => {
+  const bridge = makeBridge();
+  let firedAtFrame = -1;
+  let calls = 0;
+  async function* endless() { let i = 0; for (;;) { yield pcm16(i & 0x7fff, (i + 1) & 0x7fff); i += 2; } }
+  const ffC = fakeChildFromStream(Readable.from(endless()));
+  const spawn = (cmd) => (cmd === "yt-dlp" ? fakeChild([]) : ffC);
+  // maxSeconds 0.002 ⇒ 16 frames of 2 samples; maxBufferMs 1 ⇒ 32 bytes ⇒ an 8-frame lead.
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0, maxBufferMs: 1, maxSeconds: 0.002 });
+  const r = await audio.playYoutubeTrack("https://youtu.be/a", { onNearEnd: () => { calls += 1; firedAtFrame = bridge.bins.length; return null; } });
+  assert.equal(r.frames, 16, "capped");
+  assert.equal(calls, 1);
+  assert.equal(firedAtFrame, 8, "fired with 8 frames (the buffer lead) still to go");
+});
+
+test("crossfade: the last N of track A are equal-power mixed with the first N of prefetched B, and B resumes after them", async () => {
+  const bridge = makeBridge();
+  const logs = [];
+  const ffs = [fakeChild([pcm16(1000, 1000, 1000, 1000)]), fakeChild([pcm16(2000, 2000, 2000, 2000, 3000, 3000)])];   // A: 2 frames, B: 3 frames
+  const spawn = (cmd) => (cmd === "yt-dlp" ? fakeChild([]) : ffs.shift());
+  const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0, crossfadeSecs: 0.5, log: (m) => logs.push(m) });
+  const a = audio.prefetchYoutube("https://youtu.be/a");
+  const b = audio.prefetchYoutube("https://youtu.be/b");
+  await flush();
+  // B is short (3 frames) so the fade is capped at 3; A has only 2 ⇒ a 2-frame (4-sample) fade.
+  const ra = await audio.playYoutubeTrack(a, { onNearEnd: () => b });
+  assert.equal(ra.reason, "ended");
+  assert.equal(ra.frames, 2);
+  const mixed = bridge.bins.map(samplesOf);
+  assert.equal(mixed.length, 2);
+  const expect = [[1000, 1689], [2121, 2231]];        // t = 0, ¼, ½, ¾ of the way along cos/sin
+  for (let f = 0; f < 2; f++) for (let i = 0; i < 2; i++) assert.ok(Math.abs(mixed[f][i] - expect[f][i]) <= 1, `frame ${f} sample ${i}: ${mixed[f][i]} ≈ ${expect[f][i]}`);
+  assert.equal(b.source.consumedBytes, 8, "B's head (2 frames) was consumed by the fade");
+  assert.equal(b.fadeComplete, true);
+  assert.equal(b.usable(), true, "a completed fade leaves B claimable");
+  assert.ok(logs.some((m) => /drain done.*fade=2/.test(m)));
+  assert.deepEqual(bridge.cmds("play_audio_end").length, 1);
+
+  const rb = await audio.playYoutubeTrack(b);
+  assert.equal(rb.reason, "ended");
+  assert.equal(rb.frames, 1, "B plays only what the fade didn't already send");
+  assert.deepEqual(samplesOf(bridge.bins[2]), [3000, 3000]);
+});
+
+test("crossfade is skipped when B has no audio yet, and when the dial is at 0", async () => {
+  for (const secs of [0.5, 0]) {
+    const bridge = makeBridge();
+    const bStream = new PassThrough();
+    if (secs === 0) bStream.end(pcm16(2, 2, 2, 2));     // ready, but the dial is off
+    const ffs = [fakeChildFromStream(bStream), fakeChild([pcm16(1, 1, 1, 1)])];   // B is spawned (prefetched) first
+    const spawn = (cmd) => (cmd === "yt-dlp" ? fakeChild([]) : ffs.shift());
+    const audio = createAudioOut({ bridge, tts: {}, spawn, sleep: noSleep, refGen, chunkSamples: 2, prebufferMs: 0, crossfadeSecs: secs });
+    const b = audio.prefetchYoutube("https://youtu.be/b");
+    await flush();
+    const r = await audio.playYoutubeTrack("https://youtu.be/a", { onNearEnd: () => b });
+    assert.equal(r.frames, 2);
+    assert.deepEqual(bridge.bins.map(samplesOf), [[1, 1], [1, 1]], "A plays untouched");
+    assert.equal(b.source.consumedBytes, 0);
+    await b.kill();
+  }
+});
+
+test("a crossfade aborted midway (stop) leaves B half-spent ⇒ playYoutubeTrack(B) respawns it from the top", async () => {
+  const bridge = makeBridge();
+  const spawns = [];
+  // Spawn order: A, B, then B's respawn.
+  const ffs = [fakeChild([pcm16(1000, 1000, 1000, 1000)]), fakeChild([pcm16(2000, 2000, 2000, 2000)]), fakeChild([pcm16(2000, 2000, 2000, 2000)])];
+  const spawn = (cmd) => { spawns.push(cmd); return cmd === "yt-dlp" ? fakeChild([]) : ffs.shift(); };
+  let audio;
+  let stopped = false;
+  audio = createAudioOut({
+    bridge, tts: {}, spawn, refGen, chunkSamples: 2, prebufferMs: 0, crossfadeSecs: 0.5,
+    sleep: async () => { if (!stopped) { stopped = true; audio.stop(); } },   // the first inter-frame sleep (mid-fade) → user stop
+  });
+  const a = audio.prefetchYoutube("https://youtu.be/a");
+  const b = audio.prefetchYoutube("https://youtu.be/b");
+  await flush();                                     // both fully buffered (EOF seen) ⇒ the fade starts on A's first frame
+  const ra = await audio.playYoutubeTrack(a, { onNearEnd: () => b });
+  assert.equal(ra.reason, "stopped");
+  assert.equal(b.source.consumedBytes, 4, "one fade frame taken from B");
+  assert.equal(b.usable(), false);
+  const before = spawns.length;
+  const rb = await audio.playYoutubeTrack(b);
+  assert.equal(spawns.length, before + 2, "respawned");
+  assert.equal(rb.frames, 2, "B plays from the top");
+});
+
+test("setCrossfadeSecs snaps to 0.5 s steps, clamps to [0, 8], and fires onChange once per real change", () => {
+  const changes = [];
+  const audio = createAudioOut({ bridge: makeBridge(), tts: {}, refGen, onCrossfadeChange: (s) => changes.push(s) });
+  assert.deepEqual(audio.crossfadeBounds(), { min: 0, max: 8, step: 0.5 });
+  assert.equal(audio.getCrossfadeSecs(), 0);
+  assert.equal(audio.setCrossfadeSecs(2.3), 2.5);
+  assert.equal(audio.setCrossfadeSecs(8.7), 8);
+  assert.equal(audio.setCrossfadeSecs(-1), 0);
+  assert.equal(audio.setCrossfadeSecs("nope"), 0, "non-numeric leaves the value alone");
+  assert.equal(audio.setCrossfadeSecs(0), 0);
+  assert.deepEqual(changes, [2.5, 8, 0]);
+});

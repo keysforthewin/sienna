@@ -120,6 +120,14 @@ export async function startServer(envOverride) {
     maxBufferMs: config.SIENNA_PLAYBACK_MAX_BUFFER_MS,
     audioStatsMs: config.SIENNA_AUDIO_STATS_MS,
     musicPacingMs: config.SIENNA_MUSIC_PACING_MS,
+    burstBelowMs: config.SIENNA_MUSIC_BURST_BELOW_MS,
+    burstPacingMs: config.SIENNA_MUSIC_BURST_PACING_MS,
+    crossfadeSecs: config.SIENNA_MUSIC_CROSSFADE_SECS,
+    // Live crossfade dial (dashboard): broadcast + write-through, like the pacing sliders.
+    onCrossfadeChange: (secs) => {
+      bridge.broadcastToBrowsers({ type: "crossfade", secs });
+      if (memory) Promise.resolve(memory.setSetting("music_crossfade", secs)).catch(() => {});
+    },
     // Live music-pacing slider (dashboard): broadcast the new value so every open
     // slider syncs, and write-through to Mongo so it survives restarts (mirrors volume).
     onMusicPacingChange: (ms) => {
@@ -369,6 +377,12 @@ export async function startServer(envOverride) {
         const savedTtsPacing = await memory.getSetting("tts_pacing", null);
         if (savedTtsPacing != null) audioOut.setTtsPacingMs(savedTtsPacing);
       } catch { /* leave the SIENNA_TTS_PACING_MS default */ }
+
+      // Restore the persisted crossfade dial value.
+      try {
+        const savedFade = await memory.getSetting("music_crossfade", null);
+        if (savedFade != null) audioOut.setCrossfadeSecs(savedFade);
+      } catch { /* leave the SIENNA_MUSIC_CROSSFADE_SECS default */ }
 
       // Camera image capture. The device fans EVERY JPEG frame (0x02) here —
       // Sienna's `look` and manual Camera-panel snapshots alike — so this single

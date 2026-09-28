@@ -4,6 +4,8 @@
 // entirely on the server (POST /api/tts → audioOut.speak), so the browser just
 // sends text and shows status — no client-side decode/resample.
 
+import { createKnob } from "/js/panels/knob.js";
+
 // Keep in sync with ALLOWED_TAGS in server/enhance.js.
 const TAG_GROUPS = [
   { label: "Emotions", tags: ["[excited]", "[happy]", "[sad]", "[angry]", "[nervous]", "[curious]", "[sarcastic]", "[calm]", "[tired]"] },
@@ -48,6 +50,10 @@ export function initTtsPanel(client) {
         title="Delay between her voice frames (ms). This is the DELIVERY rate into the device buffer, not how fast she talks. Higher = nearer realtime (less bank-ahead); lower = banks her reply on-device faster. Takes effect on her next reply."
         style="flex: 1; min-width: 120px;" />
       <span id="tts-voice-pacing-val" style="color: var(--muted); width: 3.6em; text-align: right;">80ms</span>
+    </div>
+    <div class="pacing-knob-row">
+      <div id="tts-crossfade-knob"></div>
+      <span style="color: var(--muted);">Crossfade between tracks (0 = off)</span>
     </div>
   `;
 
@@ -175,6 +181,31 @@ export function initTtsPanel(client) {
       vpaceEl.value = String(m.ms);
       renderVPace(m.ms);
     }
+  });
+
+  // Crossfade dial — seconds of overlap between jukebox tracks (0 = hard cut).
+  // Same server-owned/shared pattern: send on input, reflect the connect-time
+  // snapshot + live {type:"crossfade"} broadcasts (skipped mid-drag so our own
+  // in-flight sends don't fight the echo). role=slider div, so it stays usable
+  // while the device is offline.
+  const crossfadeKnob = createKnob(root.querySelector("#tts-crossfade-knob"), {
+    key: "crossfade",
+    label: "Crossfade",
+    hint: "Seconds of crossfade between jukebox tracks; 0 = hard cut",
+    min: 0,
+    max: 8,
+    step: 0.5,
+    bigStep: 1,
+    resetValue: 0,
+    size: "sm",
+    format: (v) => (v === 0 ? "off" : `${v.toFixed(1)} s`),
+    ariaText: (v) => `${v} seconds`,
+    onInput: (v) => client.send({ type: "set_crossfade", secs: v }),
+  });
+  client.addEventListener("msg:crossfade", (ev) => {
+    const m = ev.detail || {};
+    if (typeof m.min === "number" && typeof m.max === "number") crossfadeKnob.setBounds(m.min, m.max);
+    if (typeof m.secs === "number" && !crossfadeKnob.dragging) crossfadeKnob.setValue(m.secs);
   });
 
   client.addEventListener("msg:device_connected", syncButtons);
