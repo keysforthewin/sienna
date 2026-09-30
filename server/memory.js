@@ -204,6 +204,22 @@ export function createMemory({ db, personalityTokenCap = 2000, now = () => new D
     );
   }
 
+  // Jukebox never-play list (the dashboard's "Never Play Again" button): songs
+  // permanently excluded from every mix, singleton doc keyed `_id:"blocked"` like
+  // the play history. The jukebox owns matching/dedupe; this is dumb storage.
+  async function getMusicBlocklist() {
+    const doc = await coll("music_blocklist").findOne({ _id: "blocked" });
+    return doc && Array.isArray(doc.tracks) ? doc.tracks : null;
+  }
+
+  async function setMusicBlocklist(tracks) {
+    await coll("music_blocklist").replaceOne(
+      { _id: "blocked" },
+      { _id: "blocked", tracks: Array.isArray(tracks) ? tracks : [], updated_at: now() },
+      { upsert: true },
+    );
+  }
+
   // Jukebox live-session checkpoint (restart resume): the query + full queue +
   // position of the mix that's playing right now, singleton doc keyed
   // `_id:"current"` like the play history. Written on every track start, cleared
@@ -243,6 +259,7 @@ export function createMemory({ db, personalityTokenCap = 2000, now = () => new D
     getSetting, setSetting,
     getMusicCache, setMusicCache,
     getMusicHistory, setMusicHistory,
+    getMusicBlocklist, setMusicBlocklist,
     getMusicSession, setMusicSession,
   };
 }

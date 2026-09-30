@@ -794,6 +794,105 @@ test("the persisted history loads late when memory only becomes ready after the 
   assert.deepEqual(audio.tracks, [url("a"), url("b")]); // a now filtered by the persisted history
 });
 
+// ---- never-play list (the dashboard's "Never Play Again" button) ----
+
+function makeBlocklistMemoryFake({ seedBlocklist = null, seedHistory = null, ready = true } = {}) {
+  const base = makeHistoryMemoryFake({ seedHistory, ready });
+  let stored = seedBlocklist;
+  const blocklistSets = [];
+  return {
+    ...base,
+    blocklistSets,
+    getMusicBlocklist: async () => stored,
+    setMusicBlocklist: async (tracks) => { stored = tracks; blocklistSets.push(tracks.slice()); },
+  };
+}
+
+test("a blocked title (incl. a parenthetical variant) is excluded from a mix", async () => {
+  const memory = makeBlocklistMemoryFake({ seedBlocklist: [{ id: "h", title: "Sunrise", artist: null, ts: 1 }] });
+  const { spawn } = makeSearch([[{ id: "v2", title: "Sunrise (Live)" }, { id: "b", title: "Other" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, memory, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  assert.deepEqual(audio.tracks, [url("b")]);
+  jb.stop();
+});
+
+test("the never-play list applies even with the no-repeat window disabled (historyLimit 0)", async () => {
+  const memory = makeBlocklistMemoryFake({ seedBlocklist: [{ id: null, title: "Sunrise", artist: null, ts: 1 }] });
+  const { spawn } = makeSearch([[{ id: "v2", title: "sunrise" }, { id: "b", title: "Other" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, memory, spawn, shuffle: (x) => x, sleep: async () => {}, historyLimit: 0 });
+  await jb.play({ query: "x" });
+  assert.deepEqual(audio.tracks, [url("b")]);
+  jb.stop();
+});
+
+test("a by-name request for a blocked song is refused and plays nothing", async () => {
+  const memory = makeBlocklistMemoryFake({ seedBlocklist: [{ id: "s", title: "Song", artist: null, ts: 1 }] });
+  const { spawn } = makeSearch([[{ id: "s", title: "Song" }, { id: "s2", title: "Song (Official Video)" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, memory, spawn, shuffle: (x) => x, sleep: async () => {} });
+  const res = await jb.play({ query: "song by artist", continuation: "songs like song by artist" });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /never-play list/);
+  assert.deepEqual(audio.tracks, []);
+  assert.equal(jb.isActive(), false);
+});
+
+test("blockSong on the current track skips it, persists the list, and keeps it out of later queues", async () => {
+  const memory = makeBlocklistMemoryFake();
+  const { spawn } = makeSearch([
+    [{ id: "a", title: "A" }, { id: "b", title: "B" }],
+    [{ id: "a", title: "A" }, { id: "c", title: "C" }],   // refill: a is blocked, c fresh
+  ]);
+  const audio = makeAudio({ reasons: [
+    () => new Promise(() => {}),                 // a hangs until blocked/skipped
+    { reason: "ended", frames: 1 },              // b
+    () => new Promise(() => {}),                 // refill's first track hangs
+  ] });
+  const jb = createJukebox({ audioOut: audio, memory, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  assert.deepEqual(audio.tracks, [url("a")]);
+  assert.equal(jb.status().current.id, "a");
+  const res = await jb.blockSong({ id: "a", title: "A", artist: null });
+  assert.equal(res.ok, true);
+  await waitFor(() => audio.tracks.length === 3);
+  assert.deepEqual(audio.tracks, [url("a"), url("b"), url("c")]);   // a skipped; refill dropped a
+  assert.equal(memory.blocklistSets.length, 1);
+  assert.equal(memory.blocklistSets[0][0].title, "A");
+  jb.stop();
+});
+
+test("blockSong dedupes by key and refuses an empty entry", async () => {
+  const memory = makeBlocklistMemoryFake();
+  const jb = createJukebox({ audioOut: makeAudio(), memory, spawn: makeSearch([]).spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.blockSong({ title: "Song" });
+  await jb.blockSong({ title: "Song (Live)", id: "v9" });   // same base title → replaces, not duplicates
+  assert.equal(memory.blocklistSets.at(-1).length, 1);
+  const res = await jb.blockSong({});
+  assert.equal(res.ok, false);
+});
+
+test("the persisted never-play list loads late when memory becomes ready after the first play", async () => {
+  let ready = false;
+  const memory = {
+    ready: () => ready,
+    getMusicBlocklist: async () => [{ id: "a", title: "A", artist: null, ts: 1 }],
+    setMusicBlocklist: async () => {},
+  };
+  const { spawn } = makeSearch([[{ id: "a", title: "A" }, { id: "b", title: "B" }]]);
+  const audio = makeAudio({ reasons: [() => new Promise(() => {}), () => new Promise(() => {})] });
+  const jb = createJukebox({ audioOut: audio, memory, spawn, shuffle: (x) => x, sleep: async () => {} });
+  await jb.play({ query: "x" });
+  assert.deepEqual(audio.tracks, [url("a")]);   // list not loaded yet (memory not ready)
+  jb.stop();
+  ready = true;
+  await jb.play({ query: "x" });
+  assert.deepEqual(audio.tracks, [url("a"), url("b")]); // a now dropped by the persisted list
+  jb.stop();
+});
+
 test("notePlayed records an id-only external play into the window", async () => {
   const memory = makeHistoryMemoryFake();
   const { spawn } = makeSearch([[{ id: "z", title: "Z" }, { id: "b", title: "B" }]]);

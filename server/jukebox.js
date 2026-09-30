@@ -154,6 +154,7 @@ export function createJukebox({
   function nextFreshEntry() {
     if (continuationQuery) return null;
     for (let j = index + 1; j < queue.length; j++) {
+      if (inBlocklist(queue[j])) continue;
       if (queueExempt || queueAllowsRepeats || !inWindow(queue[j])) return queue[j];
     }
     return null;
@@ -304,6 +305,58 @@ export function createJukebox({
     return historyLoad;
   }
 
+  // Never-play list (the dashboard's "Never Play Again" button): permanent, NOT
+  // gated on historyLimit (works with the no-repeat window disabled), keyed
+  // exactly like the window (id / title / base title) so every upload of a
+  // banned song is caught. Applied unconditionally — exempt (by-name) queues,
+  // the dry-pool repeat fallback, replays and restored sessions all still drop
+  // blocked tracks.
+  let blocklist = [];              // [{ id, title, artist, ts }]
+  let blockKeys = new Set();
+  let blockLoad = null;            // memoized lazy load (same retry-until-ready shape as history)
+  const inBlocklist = (t) => !!t && blockKeys.size > 0 && historyKeysOf(t).some((k) => blockKeys.has(k));
+  const notBlocked = (tracks) => tracks.filter((t) => !inBlocklist(t));
+
+  function ensureBlocklistLoaded() {
+    if (blockLoad) return blockLoad;
+    if (typeof memory?.getMusicBlocklist !== "function") return Promise.resolve();
+    if (!memory.ready?.()) return Promise.resolve();
+    blockLoad = (async () => {
+      try {
+        const stored = await memory.getMusicBlocklist();
+        if (Array.isArray(stored) && stored.length) {
+          const ram = blocklist;
+          const ramKeys = new Set(ram.flatMap(historyKeysOf));
+          blocklist = [...stored.filter((b) => !historyKeysOf(b).some((k) => ramKeys.has(k))), ...ram];
+          blockKeys = new Set(blocklist.flatMap(historyKeysOf));
+          log(`never-play list loaded: ${blocklist.length} songs`);
+        }
+      } catch { /* best-effort; start with an empty list */ }
+    })();
+    return blockLoad;
+  }
+
+  // Add a song to the never-play list (persisted) and, if it's what's playing
+  // right now, skip past it.
+  async function blockSong({ id = null, title = null, artist = null } = {}) {
+    await ensureBlocklistLoaded();
+    const entry = { id: id || null, title: title || null, artist: artist ?? null, ts: clock() };
+    const keys = historyKeysOf(entry);
+    if (!keys.length) return { ok: false, error: "Nothing to block — no song title or id given." };
+    blocklist = blocklist.filter((b) => !historyKeysOf(b).some((k) => keys.includes(k)));
+    blocklist.push(entry);
+    blockKeys = new Set(blocklist.flatMap(historyKeysOf));
+    if (memory?.ready?.() && typeof memory.setMusicBlocklist === "function") {
+      Promise.resolve(memory.setMusicBlocklist(blocklist)).catch(() => {});
+    }
+    log(`never-play list: added "${entry.title ?? entry.id}" (${blocklist.length} songs)`);
+    if (active && current && inBlocklist(current)) {
+      log(`never-play list: "${current.title}" is playing — skipping it`);
+      skip();
+    }
+    return { ok: true, text: `"${entry.title ?? entry.id}" will never play again.` };
+  }
+
   // A track put frames on the wire → it counts as played. A repeat (the
   // superseded-replay path, or the same song under a new id) moves to
   // most-recent instead of duplicating.
@@ -325,10 +378,12 @@ export function createJukebox({
   // this, both play). Returns ONLY fresh tracks (possibly empty) — the dry-pool
   // fallback is the caller's call (refill escalates first).
   function filterFresh(tracks) {
-    if (!historyEnabled() || !tracks.length) return tracks;
+    if (!tracks.length) return tracks;
+    if (!historyEnabled()) return notBlocked(tracks);
     const seen = new Set();
     const fresh = [];
     for (const t of tracks) {
+      if (inBlocklist(t)) continue;
       const keys = historyKeysOf(t);
       if (keys.some((k) => historyKeys.has(k) || seen.has(k))) continue;
       for (const k of keys) seen.add(k);
@@ -362,7 +417,7 @@ export function createJukebox({
     }
     const fresh = filterFresh(pool);
     if (fresh.length) return { tracks: shuffle(fresh), allowRepeats: false };
-    return { tracks: pool.slice(), allowRepeats: true };  // the just-played song is ALL we know → repeat beats silence
+    return { tracks: notBlocked(pool), allowRepeats: true };  // the just-played song is ALL we know → repeat beats silence (never a blocked one)
   }
 
   // External plays (the play_youtube tool) report into the window here, so the mix
@@ -392,6 +447,10 @@ export function createJukebox({
         current.artist = full[0].artist ?? null;
         notify();          // the placeholder title just resolved
         persistSession();  // re-checkpoint with the real title/id
+        if (active && inBlocklist(current)) {
+          log(`never-play list: fused start resolved to blocked "${current.title}" — skipping it`);
+          skip();
+        }
       }
       log(`cache refresh "${key}" → ${full.length} tracks stored`);
     }).catch(() => {});
@@ -444,6 +503,7 @@ export function createJukebox({
     let liveContributed = false;
     const absorb = (entries) => {
       for (const t of entries) {
+        if (inBlocklist(t)) continue;                                    // never-play list
         const keys = historyKeysOf(t);
         if (keys.length && keys.some((k) => poolKeys.has(k))) continue;  // already seen this song
         for (const k of keys) poolKeys.add(k);
@@ -495,7 +555,7 @@ export function createJukebox({
   // escalation step comes back stale, the window is full → resetWindow clears it
   // and the whole pool comes back into rotation.
   async function refill(myGen, { skipCache = false } = {}) {
-    await ensureHistoryLoaded();
+    await Promise.all([ensureHistoryLoaded(), ensureBlocklistLoaded()]);
     const { fresh, pool } = await gatherFresh(query, { useCache: !skipCache, alive: () => myGen === generation });
     if (myGen !== generation) return false;
     if (fresh.length) {
@@ -563,6 +623,14 @@ export function createJukebox({
       // elsewhere meanwhile (notePlayed), is only catchable here. Deliberate
       // repeats are exempt: by-name queues, the dry-pool fallback, and an
       // intentional same-track replay (superseded / device-loss recovery).
+      {
+        // Never-play list: checked for EVERY queue (exempt, repeats, replays,
+        // restored sessions) — a song blocked mid-session must not come back.
+        const from = index;
+        while (index < queue.length && inBlocklist(queue[index])) index += 1;
+        if (index > from) { log(`play-time check skipped ${index - from} track(s) on the never-play list`); replayCurrent = false; }
+        if (index >= queue.length) continue;     // queue ran dry → the refill branch handles it
+      }
       if (replayCurrent) {
         replayCurrent = false;
       } else if (!queueExempt && !queueAllowsRepeats) {
@@ -674,7 +742,7 @@ export function createJukebox({
     if (!term) return { ok: false, error: "What would you like me to play?" };
     const continuation = (c || "").trim() || null;  // single-song request: graduate to this
     const key = normalizeKey(term);
-    await ensureHistoryLoaded();
+    await Promise.all([ensureHistoryLoaded(), ensureBlocklistLoaded()]);
     // A by-name single-song request (continuation set) is exempt from the no-repeat
     // window: the user asked for THAT song, so its queue of versions is never filtered.
     const exemptFromHistory = !!continuation;
@@ -684,11 +752,12 @@ export function createJukebox({
     // (one track from now) escalate to live searches for fresh material.
     let seedRepeats = false;
     const seedFrom = (entries) => {
-      const fresh = exemptFromHistory ? entries : filterFresh(entries);
+      const fresh = exemptFromHistory ? notBlocked(entries) : filterFresh(entries);
       if (fresh.length) return shuffle(fresh);
+      if (!notBlocked(entries).length) return [];   // everything known is on the never-play list
       seedRepeats = true;
       log(`all ${entries.length} known tracks for "${term}" are recently played — starting on the oldest while the mix re-searches`);
-      return lruOrder(entries).slice(0, 1);
+      return lruOrder(notBlocked(entries)).slice(0, 1);
     };
 
     const cached = await readCache(key);
@@ -698,6 +767,7 @@ export function createJukebox({
       // Warm: start instantly from a random stored track (shuffle picks the first).
       log(`cache HIT "${key}" (${cached.length} tracks) — instant start`);
       seed = seedFrom(cached);
+      if (!seed.length) return { ok: false, error: `"${term}" is on the never-play list.` };
     } else if (cacheEnabled()) {
       // Cold + cache backend: FUSE search and playback — hand the search expression
       // straight to the player so ONE yt-dlp process searches AND streams the top
@@ -714,6 +784,7 @@ export function createJukebox({
       const entries = await search(term, searchLimit);
       if (!entries.length) return { ok: false, error: `I couldn't find anything on YouTube for "${term}".` };
       seed = seedFrom(entries);
+      if (!seed.length) return { ok: false, error: `"${term}" is on the never-play list.` };
     }
 
     const seededTitle = seed[0]?.title;
@@ -741,7 +812,7 @@ export function createJukebox({
     // a stale top-of-search on its own). A single-song session graduates here
     // too: "more like this" means the similar-songs search, not more versions.
     const term = continuationQuery || query;
-    await ensureHistoryLoaded();
+    await Promise.all([ensureHistoryLoaded(), ensureBlocklistLoaded()]);
     const { fresh, pool } = await gatherFresh(term, { useCache: false });
     if (!pool.length) return { ok: false, error: `I couldn't find more for "${term}".` };
     if (fresh.length) startSession(term, shuffle(fresh));
@@ -853,7 +924,7 @@ export function createJukebox({
       clearSession();
       return false;
     }
-    await ensureHistoryLoaded();
+    await Promise.all([ensureHistoryLoaded(), ensureBlocklistLoaded()]);
     query = saved.query;
     continuationQuery = saved.continuation || null;
     queue = saved.queue;
@@ -886,9 +957,9 @@ export function createJukebox({
       continuation: continuationQuery,
       queueLength: queue.length,
       index,
-      current: current ? { title: current.title, artist: current.artist ?? null, url: current.url } : null,
+      current: current ? { id: current.id ?? null, title: current.title, artist: current.artist ?? null, url: current.url } : null,
     };
   }
 
-  return { play, playMore, skip, pause, resume, suspend, resumeFromSuspend, stop, nowPlaying, status, notePlayed, restoreSession, isActive: () => active };
+  return { play, playMore, skip, pause, resume, suspend, resumeFromSuspend, stop, nowPlaying, status, notePlayed, blockSong, restoreSession, isActive: () => active };
 }

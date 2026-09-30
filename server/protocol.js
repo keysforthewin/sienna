@@ -222,6 +222,15 @@ export const SetCrossfadeCmd = z.object({
   secs: z.number().min(0).max(8),
 });
 
+// Consumed server-side: the Interact page's "Never Play Again" button — adds the
+// song to the jukebox's permanent blocklist (matched by title; id is a bonus key).
+export const BlockSongCmd = z.object({
+  type: z.literal("block_song"), ref: ref,
+  title: z.string().min(1),
+  artist: z.string().nullable().optional(),
+  id: z.string().nullable().optional(),
+});
+
 export const BrowserMsg = z.discriminatedUnion("type", [
   SetBlueLedCmd, SetBlueFlashCmd, SetFlashLedCmd, SetRgbCmd,
   ReadLdrCmd, SetLdrRateCmd,
@@ -230,7 +239,7 @@ export const BrowserMsg = z.discriminatedUnion("type", [
   PlayToneCmd, PlayAudioStartCmd, PlayAudioEndCmd, StopAudioCmd,
   SnapshotCmd, RebootCmd,
   ScanWifiCmd, ScanBleCmd, SetTimerCmd, CancelTimerCmd,
-  AgentInputCmd, SetAutonomyCmd, SetVolumeCmd, SetMusicPacingCmd, SetTtsPacingCmd, SetCrossfadeCmd,
+  AgentInputCmd, SetAutonomyCmd, SetVolumeCmd, SetMusicPacingCmd, SetTtsPacingCmd, SetCrossfadeCmd, BlockSongCmd,
   PttCmd,
 ]);
 

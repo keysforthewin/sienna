@@ -49,7 +49,7 @@ export function nowPlayingMsg(jukebox) {
   if (!s || !s.active || !s.current) return { type: "now_playing", active: false };
   return {
     type: "now_playing", active: true, paused: !!s.paused,
-    title: s.current.title, artist: s.current.artist ?? null, query: s.query,
+    title: s.current.title, artist: s.current.artist ?? null, id: s.current.id ?? null, query: s.query,
   };
 }
 
@@ -620,7 +620,9 @@ export async function startServer(envOverride) {
     // Connect-time now-playing push (the jukebox may be null when the agent is off).
     () => nowPlayingMsg(jukebox),
     // On-screen PTT button — same coordinator as the physical GPIO 45 button.
-    ptt);
+    ptt,
+    // "Never Play Again" (block_song) — the jukebox may be null when the agent is off.
+    jukebox);
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, "http://x");

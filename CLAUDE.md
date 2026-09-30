@@ -436,7 +436,23 @@ and fired device timers all feed the same `agent.run(input, {source})`. Modules
   track is re-recorded, so it can't come straight back. A **by-name** single-song
   request (a `play()` with a `continuation`) is always exempt. A zero-result
   search (yt-dlp/network failure) skips escalation and keeps the backoff-retry
-  path. `SIENNA_MUSIC_HISTORY_LIMIT=0` disables it all. The jukebox also exposes
+  path. `SIENNA_MUSIC_HISTORY_LIMIT=0` disables it all. Separate from the window is the
+  **never-play list**: the Interact page's composer has a **Next Song** button
+  beside Send (it sends the literal text "Next Song" as a normal `agent_input`
+  turn, so she skips via `skip_song`) and, once clicked with a track playing,
+  a **Never play “<title>” again** button for the song that was playing at
+  click time (snapshotted from the last `now_playing`, which now carries the
+  video `id`). That sends `{type:"block_song", title, artist, id}` (`BlockSongCmd`,
+  consumed in `ws-browser.js` → `jukebox.blockSong`; `music_unavailable` when
+  the jukebox is off). The list is persisted as the Mongo `music_blocklist`
+  singleton (`memory.getMusicBlocklist`/`setMusicBlocklist`), keyed like the
+  window (id / normalized title / base title), NOT gated on the history limit,
+  and applied at every filtering point **unconditionally** — batch filtering,
+  the cache pool, the dry-pool repeat fallback, by-name (exempt) requests (a
+  blocked song requested by name is refused), the play-time queue check
+  (replays and restored sessions included), the prefetch pick, and the fused
+  cold-start title fill-in (a start that resolves to a blocked title is
+  skipped). `blockSong` on the current track skips it immediately. The jukebox also exposes
   two seams wired in `index.js`: **now-playing broadcasts** — `onStateChange`
   fires on every state transition (track start, fused-title fill-in, pause/
   resume, stop, session end) and `index.js` maps `status()` →

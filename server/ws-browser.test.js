@@ -52,7 +52,7 @@ async function withServer(fn, opts = {}) {
   });
   const audioOut = opts.audioOut === undefined ? null : opts.audioOut;
   const ptt = opts.ptt === undefined ? null : opts.ptt;
-  attachBrowserWs(wss, bridge, TOKEN, recorder, transcriber, micStream, agent, volumes, audioOut, opts.getNowPlaying ?? null, ptt);
+  attachBrowserWs(wss, bridge, TOKEN, recorder, transcriber, micStream, agent, volumes, audioOut, opts.getNowPlaying ?? null, ptt, opts.jukebox ?? null);
   await new Promise((r) => server.listen(0, r));
   const port = server.address().port;
   try {
@@ -616,6 +616,38 @@ test("set_crossfade updates the live crossfade via audioOut, acks, and is not fo
     assert.ok(!deviceSpy.sent.some((p) => /crossfade/.test(p)), "never forwarded to the device");
     ws.close();
   }, { audioOut });
+});
+
+test("block_song hands the song to jukebox.blockSong, acks, and is not forwarded to the device", async () => {
+  const blocked = [];
+  const jukebox = { blockSong: async (song) => { blocked.push(song); return { ok: true }; } };
+  await withServer(async ({ port, bridge }) => {
+    const deviceSpy = { sent: [], send(p) { this.sent.push(p); }, on() {}, close() {} };
+    bridge.attachDevice(deviceSpy);
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    ws.send(JSON.stringify({ type: "block_song", ref: "b1", title: "Sunrise", artist: "Someone", id: "abc12345678" }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(blocked, [{ title: "Sunrise", artist: "Someone", id: "abc12345678" }]);
+    assert.ok(messages.some((m) => m && m.type === "ack" && m.ref === "b1"));
+    assert.ok(!deviceSpy.sent.some((p) => /block_song/.test(p)), "never forwarded to the device");
+    ws.close();
+  }, { jukebox });
+});
+
+test("block_song without a jukebox answers command_error music_unavailable", async () => {
+  await withServer(async ({ port }) => {
+    const ws = connect(port, TOKEN);
+    await waitOpen(ws);
+    const messages = [];
+    ws.on("message", (m) => messages.push(safeJson(m)));
+    ws.send(JSON.stringify({ type: "block_song", ref: "b2", title: "Sunrise" }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.ok(messages.some((m) => m && m.type === "command_error" && m.ref === "b2" && m.reason === "music_unavailable"));
+    ws.close();
+  });
 });
 
 test("a connecting browser is told the current crossfade + bounds", async () => {

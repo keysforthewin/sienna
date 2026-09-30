@@ -108,6 +108,16 @@ test("music history: set then get round-trips; empty store is null", async () =>
   assert.deepEqual(await m.getMusicHistory(), tracks);
 });
 
+test("music blocklist: set then get round-trips; empty store is null; non-arrays coerce to []", async () => {
+  const m = createMemory({ db: makeFakeDb() });
+  assert.equal(await m.getMusicBlocklist(), null);
+  const tracks = [{ id: "a", title: "A", artist: null, ts: 1 }];
+  await m.setMusicBlocklist(tracks);
+  assert.deepEqual(await m.getMusicBlocklist(), tracks);
+  await m.setMusicBlocklist(null);
+  assert.deepEqual(await m.getMusicBlocklist(), []);
+});
+
 test("music history: setMusicHistory overwrites and coerces non-arrays to []", async () => {
   const m = createMemory({ db: makeFakeDb() });
   await m.setMusicHistory([{ id: "a" }]);

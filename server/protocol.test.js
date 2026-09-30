@@ -181,6 +181,16 @@ test("parses device play_stats flow-control telemetry", () => {
 });
 
 
+test("block_song parses as a browser command; title required, artist/id optional", () => {
+  const ok = parseBrowserMessage(JSON.stringify({ type: "block_song", ref: "r1", title: "Song", artist: "X", id: "abc" }));
+  assert.equal(ok.type, "block_song");
+  assert.equal(ok.title, "Song");
+  const bare = parseBrowserMessage(JSON.stringify({ type: "block_song", ref: "r1", title: "Song", artist: null }));
+  assert.equal(bare.artist, null);
+  assert.throws(() => parseBrowserMessage(JSON.stringify({ type: "block_song", ref: "r1", title: "" })));
+  assert.throws(() => parseBrowserMessage(JSON.stringify({ type: "block_song", ref: "r1" })));
+});
+
 test("set_crossfade parses as a browser command with fractional seconds, bounded 0–8", () => {
   const ok = parseBrowserMessage(JSON.stringify({ type: "set_crossfade", ref: "r1", secs: 2.5 }));
   assert.equal(ok.type, "set_crossfade");

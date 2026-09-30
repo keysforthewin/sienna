@@ -41,7 +41,11 @@ export function initSiennaPanel(client) {
     </div>
     <div class="sienna-input-row">
       <textarea id="sienna-input" rows="2" placeholder="Say something to Sienna… (Enter to send)"></textarea>
-      <button id="sienna-send" class="primary">Send</button>
+      <div class="sienna-send-row">
+        <button id="sienna-send" class="primary">Send</button>
+        <button id="sienna-next" title="Ask Sienna to skip to the next song">Next Song</button>
+        <button id="sienna-ban" class="danger-ghost" hidden></button>
+      </div>
     </div>
     <div id="sienna-speech" class="sienna-speech"></div>
     <div class="sienna-controls">
@@ -62,13 +66,17 @@ export function initSiennaPanel(client) {
   const feedsWrap = logsRoot.querySelector("#sienna-feeds");
   const input = root.querySelector("#sienna-input");
   const sendBtn = root.querySelector("#sienna-send");
+  const nextBtn = root.querySelector("#sienna-next");
+  const banBtn = root.querySelector("#sienna-ban");
   const statusEl = root.querySelector("#sienna-status");
   const npBar = root.querySelector("#sienna-nowplaying");
   const npText = root.querySelector("#sienna-np-text");
 
   // Now-playing bar: driven by the server's now_playing broadcasts (one arrives on
   // connect with the current state, then live on every track change / pause / stop).
+  let lastNp = null;   // latest now_playing payload — the "Next Song" click snapshots it
   function renderNowPlaying(np) {
+    lastNp = np;
     if (!np || !np.active || !np.title) { npBar.hidden = true; npText.replaceChildren(); return; }
     const bits = [document.createTextNode(`“${np.title}”`)];
     const span = (cls, text) => { const s = document.createElement("span"); s.className = cls; s.textContent = text; return s; };
@@ -290,6 +298,32 @@ export function initSiennaPanel(client) {
     input.value = "";  // her reply (and this turn's "you" entry) arrive via sienna_entry
   }
   sendBtn.addEventListener("click", send);
+
+  // "Next Song": the literal text goes through the normal agent path (she skips
+  // via skip_song), and the song that was playing at click time becomes the
+  // candidate for "Never Play Again". Nothing playing → no ban button.
+  let banCandidate = null;
+  function showBan(np) {
+    banCandidate = { title: np.title, artist: np.artist ?? null, id: np.id ?? null };
+    banBtn.textContent = `Never play “${np.title}” again`;
+    banBtn.hidden = false;
+  }
+  function hideBan() { banCandidate = null; banBtn.hidden = true; }
+  nextBtn.addEventListener("click", () => {
+    const np = lastNp;
+    const ref = client.send({ type: "agent_input", text: "Next Song" });
+    if (ref === null) { statusEl.textContent = "not connected"; return; }
+    if (np && np.active && np.title && np.title !== "Loading…") showBan(np);
+    else hideBan();
+  });
+  banBtn.addEventListener("click", () => {
+    if (!banCandidate) return;
+    const song = banCandidate;
+    const ref = client.send({ type: "block_song", ...song });
+    if (ref === null) { statusEl.textContent = "not connected"; return; }
+    hideBan();
+    statusEl.textContent = `Blocked “${song.title}” — it will never play again`;
+  });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   });
@@ -339,6 +373,8 @@ export function initSiennaPanel(client) {
     if (ev.detail.reason === "agent_unavailable") {
       statusEl.textContent = "Sienna's agent isn't configured (needs MongoDB + Gemini).";
     }
+    if (ev.detail.reason === "music_unavailable") statusEl.textContent = "The jukebox isn't available (agent off).";
+    if (ev.detail.reason === "block_failed") statusEl.textContent = "Couldn't add that song to the never-play list.";
   });
 
   // Refresh the relative timestamps in place.

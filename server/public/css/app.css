@@ -368,6 +368,8 @@ input[type=range] { accent-color: var(--accent); flex: 1; min-width: 0; }
 /* Send sits on its own line UNDER the textarea (a right-edge button was easy to miss). */
 .sienna-input-row { display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-2); align-items: flex-start; }
 .sienna-input-row textarea { width: 100%; }
+.sienna-send-row { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }
+.sienna-send-row button[hidden] { display: none; }
 .sienna-controls { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-2); flex-wrap: wrap; }
 .sienna-toggle { display: flex; flex-direction: row; align-items: center; gap: var(--space-2); color: var(--muted); font-size: var(--fs-300); }
 .sienna-status { color: var(--muted); font-size: var(--fs-200); font-style: italic; }

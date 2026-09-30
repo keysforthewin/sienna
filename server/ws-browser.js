@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 const ACK_TIMEOUT_MS = 5000;
 
-export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micStream, agent = null, volumes = null, audioOut = null, getNowPlaying = null, ptt = null) {
+export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micStream, agent = null, volumes = null, audioOut = null, getNowPlaying = null, ptt = null, jukebox = null) {
   wss.on("connection", (ws, req) => {
     const url = new URL(req.url, "http://x");
     const sentToken = url.searchParams.get("token");
@@ -194,6 +194,16 @@ export function attachBrowserWs(wss, bridge, token, recorder, transcriber, micSt
       if (msg.type === "set_tts_pacing") {
         if (audioOut?.setTtsPacingMs) audioOut.setTtsPacingMs(msg.ms);
         ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true }));
+        return;
+      }
+      // "Never Play Again": permanently blocklist a song in the jukebox (title-matched).
+      // Consumed here; the jukebox skips it if it's the current track.
+      if (msg.type === "block_song") {
+        if (!jukebox?.blockSong) { ws.send(JSON.stringify({ type: "command_error", ref: browserRef, reason: "music_unavailable" })); return; }
+        Promise.resolve()
+          .then(() => jukebox.blockSong({ title: msg.title, artist: msg.artist ?? null, id: msg.id ?? null }))
+          .then(() => ws.send(JSON.stringify({ type: "ack", ref: browserRef, ok: true })))
+          .catch((e) => { try { ws.send(JSON.stringify({ type: "command_error", ref: browserRef, reason: "block_failed", detail: e?.message })); } catch {} });
         return;
       }
       // Crossfade dial: seconds of crossfade between jukebox tracks. onCrossfadeChange
